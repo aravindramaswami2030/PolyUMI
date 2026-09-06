@@ -19,6 +19,7 @@ from polyumi_ingest.preproc.slam_step import (
     _export_telemetry_json,
     _make_temp_settings_yaml,
     _parse_trajectory_csv,
+    _scan_map_builder_log,
     _write_slam_results,
 )
 
@@ -614,16 +615,209 @@ def test_slam_config_yaml_supplies_the_values(monkeypatch) -> None:
     """config/slam.yaml is the only home for these; env vars override it, nothing else does."""
     monkeypatch.delenv('POLYUMI_SLAM_RES_DIV', raising=False)
     monkeypatch.delenv('POLYUMI_SLAM_LOC_STRIDE', raising=False)
+    monkeypatch.delenv('POLYUMI_SLAM_ACCUMULATE', raising=False)
     monkeypatch.setattr(
         'polyumi_ingest.preproc.slam_step.load_slam_config',
-        lambda: {'resolution_divisor': 4, 'localization_frame_stride': 3},
+        lambda: {
+            'resolution_divisor': 4,
+            'localization_frame_stride': 3,
+            'accumulate_map': True,
+        },
     )
     step = OrbSlam3Step()
     assert (step.resolution_divisor, step.localization_frame_stride) == (4, 3)
+    assert step.accumulate_map is True
 
     # env wins over the file, for one-off experiments
     monkeypatch.setenv('POLYUMI_SLAM_LOC_STRIDE', '1')
     assert OrbSlam3Step().localization_frame_stride == 1
+    monkeypatch.setenv('POLYUMI_SLAM_ACCUMULATE', 'false')
+    assert OrbSlam3Step().accumulate_map is False
+
+
+def test_scan_map_builder_log_reads_the_atlas_state(tmp_path: pathlib.Path) -> None:
+    """The accumulation guard reads its facts out of the binary's own stdout."""
+    stdout_log = tmp_path / 'acc.stdout'
+    stdout_log.write_text(
+        'Initialization of Atlas from file: /tmp/scene.atlas.osa\n'
+        '  Loaded map 0 has 12 KFs\n'
+        '  Loaded map 1 has 140 KFs\n'
+        'Atlas loaded! Active map 1 with 140 KFs\n'
+        'INIT_RELOCALIZE success!\n'
+    )
+    # map 1 (12 KFs) clears the rival threshold; the active map itself is not counted.
+    assert _scan_map_builder_log(stdout_log) == (140, 1, True)
+
+
+def test_scan_map_builder_log_detects_a_pass_that_never_joined(tmp_path: pathlib.Path) -> None:
+    """No INIT_RELOCALIZE line means the pass never entered the map it loaded."""
+    stdout_log = tmp_path / 'acc.stdout'
+    stdout_log.write_text('  Loaded map 0 has 140 KFs\nAtlas loaded! Active map 0 with 140 KFs\n')
+    assert _scan_map_builder_log(stdout_log) == (140, 0, False)
+
+    # A run that never got far enough to write a log must not read as a success.
+    assert _scan_map_builder_log(tmp_path / 'absent.stdout') == (None, 0, False)
+
+
+def test_accumulation_maps_every_episode_then_localizes_all_of_them(tmp_path: pathlib.Path) -> None:
+    """
+    With accumulate_map on, episodes join the map and *everything* is localized after.
+
+    The mapping pass is localized too, which it is not otherwise: the map kept growing after
+    its phase-1 trajectory was written, so re-localizing is what puts every episode in the
+    finished map's frame.
+    """
+    scene_zarr = tmp_path / 'scene.zarr'
+    root = zarr.open_group(str(scene_zarr), mode='w', zarr_format=2)
+    _make_episode(root, 'episode_0', session_type='MAPPING')
+    _make_episode(root, 'episode_1', session_type='EPISODE')
+    _make_episode(root, 'episode_2', session_type='EPISODE')
+
+    settings = _calibrated_settings(tmp_path)
+    step = OrbSlam3Step(settings_yaml=settings, accumulate_map=True)
+
+    accumulated: list[str] = []
+    localized: list[str] = []
+
+    def _fake_build(ep_grp, atlas_path, log_dir, scene_zarr):
+        atlas_path.touch()
+
+    def _fake_accumulate(ep_grp, episode_index, atlas_path, log_dir, scene_zarr):
+        accumulated.append(ep_grp.name)
+        return True, 100 + len(accumulated)
+
+    def _fake_localize(ep_grp, episode_index, atlas_path, log_dir, scene_zarr):
+        localized.append(ep_grp.name)
+        n_frames = ep_grp['timestamps/gopro'].shape[0]
+        poses = np.zeros((n_frames, 7), dtype=np.float64)
+        poses[:, 6] = 1.0
+        _write_slam_results(ep_grp, poses, settings, atlas_path, accumulated_map=True)
+
+    with (
+        mock.patch.object(step, '_build_map', side_effect=_fake_build),
+        mock.patch.object(step, '_accumulate_episode', side_effect=_fake_accumulate),
+        mock.patch.object(step, '_localize_episode', side_effect=_fake_localize),
+    ):
+        step.run_step(scene_zarr)
+
+    # The mapping pass seeds the map; it is not fed back into it.
+    assert accumulated == ['/episode_1', '/episode_2']
+    # It is never localized either -- a scene sweep is not a demonstration, and DP export
+    # skips MAPPING sessions -- so its stale phase-1 poses are dropped instead.
+    assert localized == ['/episode_1', '/episode_2']
+    assert 'slam_poses' not in root['episode_0/gopro']
+    assert root['episode_0/annotations/slam'].attrs['poses_dropped_after_accumulation'] is True
+    assert root['episode_1/annotations/slam'].attrs['accumulated_map'] is True
+
+
+def test_accumulation_survives_an_episode_that_never_joins(tmp_path: pathlib.Path) -> None:
+    """An episode that cannot relocalize is logged and skipped, not fatal."""
+    scene_zarr = tmp_path / 'scene.zarr'
+    root = zarr.open_group(str(scene_zarr), mode='w', zarr_format=2)
+    _make_episode(root, 'episode_0', session_type='MAPPING')
+    _make_episode(root, 'episode_1', session_type='EPISODE')
+
+    settings = _calibrated_settings(tmp_path)
+    step = OrbSlam3Step(settings_yaml=settings, accumulate_map=True)
+
+    def _fake_localize(ep_grp, episode_index, atlas_path, log_dir, scene_zarr):
+        n_frames = ep_grp['timestamps/gopro'].shape[0]
+        poses = np.zeros((n_frames, 7), dtype=np.float64)
+        poses[:, 6] = 1.0
+        _write_slam_results(ep_grp, poses, settings, atlas_path, accumulated_map=True)
+
+    with (
+        mock.patch.object(step, '_build_map', side_effect=lambda e, a, ld, sz: a.touch()),
+        mock.patch.object(step, '_accumulate_episode', return_value=(False, 66)),
+        mock.patch.object(step, '_localize_episode', side_effect=_fake_localize),
+    ):
+        step.run_step(scene_zarr)  # must not raise
+
+    assert 'slam_poses' in root['episode_1/gopro']
+
+
+def test_accumulation_survives_a_crashing_pass(tmp_path: pathlib.Path) -> None:
+    """
+    A map-builder abort during accumulation must not cost the scene its map.
+
+    Multi-session inertial mapping aborts upstream often enough to be routine -- a keyframe
+    left without IMU preintegration can send the inertial optimizer to NaN, which Sophus turns
+    into SIGABRT. Accumulation is an enhancement, so the map keeps whatever earlier episodes
+    contributed and every episode is still localized against it.
+    """
+    scene_zarr = tmp_path / 'scene.zarr'
+    root = zarr.open_group(str(scene_zarr), mode='w', zarr_format=2)
+    _make_episode(root, 'episode_0', session_type='MAPPING')
+    _make_episode(root, 'episode_1', session_type='EPISODE')
+    _make_episode(root, 'episode_2', session_type='EPISODE')
+
+    settings = _calibrated_settings(tmp_path)
+    step = OrbSlam3Step(settings_yaml=settings, accumulate_map=True)
+    localized: list[str] = []
+
+    def _fake_accumulate(ep_grp, episode_index, atlas_path, log_dir, scene_zarr):
+        if episode_index == 1:
+            raise RuntimeError('ORB-SLAM3 map accumulation (episode 1) exited with code -6')
+        return True, 73
+
+    def _fake_localize(ep_grp, episode_index, atlas_path, log_dir, scene_zarr):
+        localized.append(ep_grp.name)
+        n_frames = ep_grp['timestamps/gopro'].shape[0]
+        poses = np.zeros((n_frames, 7), dtype=np.float64)
+        poses[:, 6] = 1.0
+        _write_slam_results(ep_grp, poses, settings, atlas_path, accumulated_map=True)
+
+    with (
+        mock.patch.object(step, '_build_map', side_effect=lambda e, a, ld, sz: a.touch()),
+        mock.patch.object(step, '_accumulate_episode', side_effect=_fake_accumulate),
+        mock.patch.object(step, '_localize_episode', side_effect=_fake_localize),
+    ):
+        step.run_step(scene_zarr)  # the crash must not propagate
+
+    # The crashing episode is still localized, alongside the one that joined.
+    assert localized == ['/episode_1', '/episode_2']
+
+
+def test_accumulate_episode_reports_a_pass_that_never_relocalized(tmp_path: pathlib.Path) -> None:
+    """
+    _accumulate_episode returns False, and leaves the atlas alone, when the map was not joined.
+
+    The live atlas must survive untouched: a pass that contributed nothing has no business
+    replacing the map that earlier episodes built.
+    """
+    scene_zarr = tmp_path / 'scene.zarr'
+    root = zarr.open_group(str(scene_zarr), mode='w', zarr_format=2)
+    ep = _make_episode(root, 'episode_1', session_type='EPISODE')
+
+    settings = _calibrated_settings(tmp_path)
+    step = OrbSlam3Step(settings_yaml=settings, accumulate_map=True)
+
+    atlas_path = tmp_path / 'scene.atlas.osa'
+    atlas_path.write_text('original atlas')
+    log_dir = tmp_path / 'slam_logs'
+    log_dir.mkdir()
+
+    def _fake_run(cmd, stdout_log, stderr_log, label, cwd=None, env=None):
+        stdout_log.write_text('  Loaded map 0 has 140 KFs\nAtlas loaded! Active map 0 with 140 KFs\n')
+        # A pass that never relocalized still writes an atlas on shutdown; it just holds
+        # nothing new. Writing it here proves the swap is gated on relocalization, not on
+        # the file's existence.
+        pathlib.Path(str(atlas_path) + '.pending').write_text('useless atlas')
+
+    with (
+        mock.patch('polyumi_ingest.preproc.slam_step.resolve_gopro_mp4', return_value=tmp_path / 'v.mp4'),
+        mock.patch(
+            'polyumi_ingest.preproc.slam_step._export_episode',
+            return_value=(tmp_path / 'v.mp4', tmp_path / 't.json', np.zeros(4)),
+        ),
+        mock.patch.object(step, '_run_subprocess', side_effect=_fake_run),
+    ):
+        joined, kfs_at_load = step._accumulate_episode(ep, 1, atlas_path, log_dir, scene_zarr)
+
+    assert joined is False
+    assert kfs_at_load == 140
+    assert atlas_path.read_text() == 'original atlas'
+    assert not pathlib.Path(str(atlas_path) + '.pending').exists()
 
 
 def test_missing_slam_config_key_raises(monkeypatch) -> None:

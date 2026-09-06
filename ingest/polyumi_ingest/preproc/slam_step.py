@@ -58,6 +58,17 @@ _SLAM_MASK_PNG = _REPO_ROOT / 'ingest' / 'config' / 'slam_mask.png'
 # slam.yaml.
 _TRAJ_TOLERANCE_FRAC = 0.5
 
+# Map-builder stdout markers, used to verify that an accumulation pass actually joined the
+# atlas it was handed rather than branching a map of its own.  Parsing stdout is what keeps
+# accumulation a pure-Python change: the binaries already print everything needed.
+#: Printed by System::System once the loaded atlas' largest map has been made active.
+_ATLAS_ACTIVE_RE = re.compile(r'Atlas loaded! Active map (\d+) with (\d+) KFs')
+#: Printed once per map in the loaded atlas, before one is chosen.
+_ATLAS_LOADED_MAP_RE = re.compile(r'Loaded map (\d+) has (\d+) KFs')
+#: Printed by Tracking once it relocalizes into a loaded map and starts appending to it.
+#: Without this line the pass contributed nothing to the map it loaded.
+_INIT_RELOC_OK = 'INIT_RELOCALIZE success!'
+
 
 def _require_slam_setting(key: str) -> int:
     """
@@ -76,6 +87,67 @@ def _require_slam_setting(key: str) -> int:
             f'{SLAM_CONFIG_YAML} has no {key!r} entry. It controls how much data the SLAM '
             f'step is fed and has no safe default; add it to the config file.'
         ) from None
+
+
+def _require_slam_flag(key: str) -> bool:
+    """
+    Read one required boolean tunable from ``config/slam.yaml``, raising if it isn't there.
+
+    Same no-default policy as :func:`_require_slam_setting`, for the same reason: this one
+    decides how the map is built, which changes every pose in the scene.  A code-side default
+    disagreeing with the checked-in config would silently produce two corpora whose poses came
+    from different maps.
+    """
+    config = load_slam_config()
+    try:
+        return bool(config[key])
+    except KeyError:
+        raise KeyError(
+            f'{SLAM_CONFIG_YAML} has no {key!r} entry. It controls how the SLAM map is built '
+            f'and has no safe default; add it to the config file.'
+        ) from None
+
+
+def _env_flag(name: str) -> bool | None:
+    """Read a boolean env override, returning None when the variable is unset."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    return raw.strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+#: Keyframes a rival map needs before it counts as somewhere an episode's work could have
+#: gone.  Every accumulation pass leaves an empty shell behind -- ``CreateMapInAtlas`` runs on
+#: the final tracking loss and the run ends before anything is inserted into it -- and the
+#: initial build leaves a 2-KF stub the same way.  Warning on those means warning every run.
+_RIVAL_MAP_MIN_KFS = 10
+
+
+def _scan_map_builder_log(stdout_log: pathlib.Path) -> tuple[int | None, int, bool]:
+    """
+    Read a map-builder run's stdout back for the atlas facts the binary printed.
+
+    Returns ``(active_map_kfs_at_load, n_rival_maps, relocalized)``.  The first is the size of
+    the map that was made active (None when the run built from scratch).  ``n_rival_maps``
+    counts only the *other* maps big enough to hold real work (see ``_RIVAL_MAP_MIN_KFS``), so
+    the empty shells every pass leaves behind do not read as fragmentation.  ``relocalized``
+    says whether tracking ever entered the loaded map; a pass that never relocalized cannot
+    have appended to it.
+    """
+    if not stdout_log.exists():
+        return None, 0, False
+    text = stdout_log.read_text(errors='replace')
+    active = _ATLAS_ACTIVE_RE.search(text)
+    active_kfs = int(active.group(2)) if active else None
+    sizes = sorted((int(kfs) for _, kfs in _ATLAS_LOADED_MAP_RE.findall(text)), reverse=True)
+    # The active map is the largest, so drop one instance of it before counting rivals.
+    if sizes:
+        sizes = sizes[1:]
+    return (
+        active_kfs,
+        sum(1 for kfs in sizes if kfs >= _RIVAL_MAP_MIN_KFS),
+        _INIT_RELOC_OK in text,
+    )
 
 
 def _export_telemetry_json(
@@ -347,6 +419,7 @@ def _write_slam_results(
     settings_path: pathlib.Path,
     atlas_path: pathlib.Path,
     frame_stride: int = 1,
+    accumulated_map: bool = False,
 ) -> None:
     """
     Write SLAM poses and summary annotations back into ep_grp.
@@ -414,6 +487,10 @@ def _write_slam_results(
     slam_grp.attrs['n_relocalization_events'] = transitions
     slam_grp.attrs['orb_slam3_settings_path'] = str(settings_path.resolve())
     slam_grp.attrs['atlas_path'] = str(atlas_path.resolve())
+    #: True when the atlas these poses came from was grown with the scene's own episodes
+    #: rather than built from the MAPPING sweep alone. Two scenes that disagree here were
+    #: localized against differently-constructed maps.
+    slam_grp.attrs['accumulated_map'] = bool(accumulated_map)
 
     log.info(
         f'  SLAM results: {n_fed_tracked}/{n_fed} fed frames tracked '
@@ -428,6 +505,10 @@ def _write_slam_results(
 class OrbSlam3Step(PreprocessingStep):
     """
     Estimate per-frame GoPro poses from video + IMU via monocular-inertial ORB-SLAM3.
+
+    Phase 1b (map accumulation, when ``accumulate_map`` is set): re-runs the map
+    builder over every episode with the atlas loaded as well as saved, so each
+    episode's keyframes join the map before anything is localized against it.
 
     Phase 1 (map building): exports the MAPPING episode as an mp4 video plus
     GoPro-style telemetry JSON, invokes the map-building binary, saves the
@@ -493,6 +574,7 @@ class OrbSlam3Step(PreprocessingStep):
         timeout_s: float | None = None,
         resolution_divisor: int | None = None,
         localization_frame_stride: int | None = None,
+        accumulate_map: bool | None = None,
     ) -> None:
         """
         Initialize the ORB-SLAM3 step.
@@ -524,6 +606,10 @@ class OrbSlam3Step(PreprocessingStep):
             source).  Map building is deliberately left at full rate -- decimating it
             measured no benefit and 20 fps mapping failed outright.  Read from
             ``config/slam.yaml`` unless overridden by ``POLYUMI_SLAM_LOC_STRIDE``.
+        accumulate_map:
+            Grow the atlas with every episode before localizing anything, rather than
+            mapping from the MAPPING sweep alone.  See :meth:`prepare_scene`.  Read from
+            ``config/slam.yaml`` unless overridden by ``POLYUMI_SLAM_ACCUMULATE``.
 
         Neither has an in-code default.  These two numbers decide what ORB-SLAM3 ever sees,
         and they are recorded per episode (``annotations/slam/frame_stride``) and enforced to
@@ -569,6 +655,10 @@ class OrbSlam3Step(PreprocessingStep):
             )
         self.resolution_divisor = resolution_divisor
         self.localization_frame_stride = localization_frame_stride
+        if accumulate_map is None:
+            env = _env_flag('POLYUMI_SLAM_ACCUMULATE')
+            accumulate_map = env if env is not None else _require_slam_flag('accumulate_map')
+        self.accumulate_map = bool(accumulate_map)
 
     @property
     def _vocab_path(self) -> pathlib.Path:
@@ -665,12 +755,100 @@ class OrbSlam3Step(PreprocessingStep):
             if traj_out.exists():
                 log.info(f'  Mapping trajectory saved to {traj_out}')
                 poses = _parse_trajectory_csv(traj_out, frame_ts)
+                # Not accumulated: this is the seed map, written before any episode joins it.
+                # Under accumulation these poses are superseded in phase 2 anyway.
                 _write_slam_results(ep_grp, poses, self.settings_yaml, atlas_path)
 
             shutil.rmtree(tmp_dir, ignore_errors=True)
         except Exception:
             log.error(f'Map building failed; temp dir preserved for debugging: {tmp_dir}')
             raise
+
+    def _accumulate_episode(
+        self,
+        ep_grp: zarr.Group,
+        episode_index: int,
+        atlas_path: pathlib.Path,
+        log_dir: pathlib.Path,
+        scene_zarr: pathlib.Path,
+    ) -> tuple[bool, int | None]:
+        """
+        Run the map builder over one episode so its keyframes join the existing atlas.
+
+        Same binary and settings as :meth:`_build_map` -- the difference is that the atlas is
+        loaded as well as saved, which puts ``Tracking`` into ``INIT_RELOCALIZE``: it
+        relocalizes into the loaded map and appends to it instead of initializing a map of its
+        own.  Full frame rate, matching map building.
+
+        Returns ``(joined, kfs_at_load)``.  ``joined`` is False when the pass contributed
+        nothing, which is not fatal on its own -- the atlas is simply no richer than it was.
+        ``kfs_at_load`` is the active map's size *before* this pass, which is the only way to
+        see the map grow: the map builder cannot report its own final state (doing so
+        deadlocks against LocalMapping's shutdown), so each pass' contribution shows up in the
+        next one's load.
+
+        No trajectory is written back here.  ``INIT_RELOCALIZE`` rewrites every loaded
+        keyframe's timestamp to append the new session to the map's timeline, so poses out of
+        an accumulation pass are on a shifted clock; the phase-2 localization pass is what
+        produces the poses the rest of the pipeline consumes.
+        """
+        gopro_mp4 = resolve_gopro_mp4(ep_grp, scene_zarr)
+        tmp_dir = pathlib.Path(tempfile.mkdtemp(prefix=f'polyumi_slam_acc{episode_index}_'))
+        # Save to a scratch path and swap in only on success. The binary std::remove()s its
+        # target before writing, so mapping straight onto the live atlas would destroy the
+        # accumulated map if this pass crashed partway through.
+        pending = atlas_path.with_name(atlas_path.name + '.pending')
+        try:
+            video_path, json_path, _ = _export_episode(ep_grp, tmp_dir, gopro_mp4)
+            settings_path = _make_temp_settings_yaml(
+                self.settings_yaml,
+                tmp_dir,
+                save_atlas=pending,
+                load_atlas=atlas_path,
+                res_div=self.resolution_divisor,
+            )
+            stdout_log = log_dir / f'episode_{episode_index}_accumulate.stdout'
+            self._run_subprocess(
+                [
+                    str(self.map_builder_bin),
+                    str(self._vocab_path),
+                    str(settings_path),
+                    str(video_path),
+                    str(json_path),
+                    str(tmp_dir / 'accumulate_trajectory.csv'),
+                ],
+                stdout_log,
+                log_dir / f'episode_{episode_index}_accumulate.stderr',
+                label=f'ORB-SLAM3 map accumulation (episode {episode_index})',
+                cwd=log_dir,
+            )
+            kfs_at_load, n_rival_maps, relocalized = _scan_map_builder_log(stdout_log)
+            if n_rival_maps:
+                log.warning(
+                    f'  Atlas held {n_rival_maps} other non-trivial map(s) when episode '
+                    f'{episode_index} loaded it; only the largest is extended, so an earlier '
+                    f'episode branched off instead of joining. See {stdout_log}'
+                )
+            if not relocalized:
+                log.warning(
+                    f'  Episode {episode_index} never relocalized into the atlas, so it added '
+                    f'nothing to the map. Its own frames are unaffected -- it will still be '
+                    f'localized in phase 2. See {stdout_log}'
+                )
+                return False, kfs_at_load
+            if not pending.exists():
+                raise RuntimeError(
+                    f'Map accumulation for episode {episode_index} reported success but wrote no atlas to {pending}'
+                )
+            os.replace(pending, atlas_path)
+            return True, kfs_at_load
+        finally:
+            # Unlike the map build and localization, a failure here is expected often enough to
+            # be routine (the caller treats it as "this episode added nothing"), so the temp dir
+            # is not kept for post-mortems -- the binary's stdout/stderr in slam_logs carry the
+            # diagnosis and outlive the run. Dropping `pending` leaves the live atlas untouched.
+            pending.unlink(missing_ok=True)
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def _localize_episode(
         self,
@@ -730,6 +908,7 @@ class OrbSlam3Step(PreprocessingStep):
                 self.settings_yaml,
                 atlas_path,
                 frame_stride=self.localization_frame_stride,
+                accumulated_map=self.accumulate_map,
             )
             shutil.rmtree(tmp_dir, ignore_errors=True)
         except Exception:
@@ -739,6 +918,13 @@ class OrbSlam3Step(PreprocessingStep):
     def prepare_scene(self, scene: SceneContext) -> None:
         """
         Phase 1: build the ORB-SLAM3 atlas from the scene's MAPPING session.
+
+        With ``accumulate_map`` set, the map does not stop there: every episode is then fed to
+        the map builder against the atlas as it stands, so the finished map contains the
+        scene's own manipulation footage and not just the mapping walk.  That matters because
+        the sweep never sees the close-up viewpoints an episode occupies during manipulation,
+        which is exactly where tracking tends to be lost -- the map is thin in the region the
+        camera cares about most.  See :meth:`_accumulate_scene`.
 
         Expects one episode group with ``session_type`` set to ``'MAPPING'`` (written by
         ``build_pzarr``). A scene recorded without a mapping pass has none, and rather than
@@ -813,10 +999,118 @@ class OrbSlam3Step(PreprocessingStep):
         elapsed = time.monotonic() - t0
         log.info(f'Map built in {elapsed:.1f}s: {self.atlas_path}')
 
+        if self.accumulate_map:
+            self._accumulate_scene(scene, mapping)
+
+    def _accumulate_scene(self, scene: SceneContext, mapping: Episode) -> None:
+        """
+        Grow the atlas with each episode in turn, so the map sees more than the mapping sweep.
+
+        Runs after the seed map exists and before any localization.  Each episode is fed to the
+        map builder against the atlas as it stands, so episode N is mapped into a map that
+        already contains episodes 1..N-1.  Phase 2 then re-localizes every episode against the
+        finished map, which is what lets the early episodes benefit from the later ones.
+
+        An episode that cannot relocalize into the atlas contributes nothing and is logged;
+        that is not fatal, since it is still localized normally in phase 2.
+        """
+        candidates = [ep for ep in scene.episodes if ep.key != mapping.key and ep.failure is None]
+        if not candidates:
+            log.info('Map accumulation: no usable EPISODE groups to add; map is the mapping sweep alone.')
+            return
+
+        log.info(f'Map accumulation: adding {len(candidates)} episode(s) to the map...')
+        t0 = time.monotonic()
+        joined = 0
+        crashed = 0
+        seed_kfs: int | None = None
+        prev_kfs: int | None = None
+        for ep in candidates:
+            # Accumulation is an enhancement, not a requirement: the map is already usable
+            # before any of this runs, and every episode is localized against it either way.
+            # So one episode failing must not cost the whole scene the map built so far.
+            #
+            # These runs really do abort. Multi-session *inertial* mapping is fragile upstream:
+            # the loaded map's IMU state need not reconcile with the incoming session, and a
+            # keyframe left without preintegration can send the inertial optimizer to NaN,
+            # which Sophus turns into SIGABRT. The live atlas survives regardless -- a pass
+            # writes to a scratch path and is swapped in only on success.
+            try:
+                ok, kfs_at_load = self._accumulate_episode(
+                    ep.group, ep.index, self.atlas_path, self.log_dir, scene.zarr_path
+                )
+            except Exception as err:
+                crashed += 1
+                log.warning(
+                    f'  Episode {ep.index} crashed during map accumulation and added nothing '
+                    f'({err}). The map keeps everything earlier episodes contributed, and this '
+                    f'episode is still localized in phase 2.'
+                )
+                continue
+            joined += int(ok)
+            if seed_kfs is None:
+                seed_kfs = kfs_at_load
+            # A pass' own contribution only becomes visible in the *next* pass' load, so this
+            # reports the growth the previous episode produced, not this one's.
+            if kfs_at_load is not None and prev_kfs is not None:
+                log.info(f'  Map at {kfs_at_load} KFs (was {prev_kfs}) entering episode {ep.index}')
+            if kfs_at_load is not None:
+                prev_kfs = kfs_at_load
+        log.info(
+            f'Map accumulation: {joined}/{len(candidates)} episode(s) joined the map in {time.monotonic() - t0:.1f}s'
+            + (f' ({crashed} crashed)' if crashed else '')
+        )
+        if seed_kfs is not None and prev_kfs is not None and prev_kfs > seed_kfs:
+            log.info(
+                f"Map grew {seed_kfs} -> at least {prev_kfs} KFs (the last episode's own "
+                f'contribution lands after the final measurable load).'
+            )
+        if joined == 0:
+            log.warning(
+                'No episode joined the map, so it is identical to the mapping sweep alone and '
+                'localization will behave exactly as with accumulation off. Usually this means '
+                'the episodes do not overlap the mapping sweep enough to relocalize.'
+            )
+        if joined:
+            self._drop_stale_mapping_poses(mapping)
+
+    @staticmethod
+    def _drop_stale_mapping_poses(mapping: Episode) -> None:
+        """
+        Delete the mapping pass' phase-1 poses once accumulation has moved the map under them.
+
+        Those poses were written against the seed map.  Accumulation then grew that map and
+        bundle adjustment shifted it, so they now describe a frame no other episode is in.
+        Nothing should consume a trajectory in a frame of its own, and re-deriving it would
+        cost a full localization pass for poses that go nowhere: DP export skips MAPPING
+        sessions, and the mapping walk is a scene sweep rather than a demonstration of the task.
+
+        The ``annotations/slam`` summary is left in place -- it honestly describes the map
+        build, which is what ``check_mapping`` and friends read it for -- and flagged so the
+        missing array does not look like a failure.
+        """
+        gopro_grp = mapping.group.require_group('gopro')
+        if 'slam_poses' in gopro_grp:
+            del gopro_grp['slam_poses']
+        slam_grp = mapping.group.require_group('annotations').require_group('slam')
+        #: Set when phase-1 poses were dropped because accumulation moved the map beneath them.
+        #: The tracking numbers beside it still describe the map build that produced the atlas.
+        slam_grp.attrs['poses_dropped_after_accumulation'] = True
+        log.info(
+            f'Dropped {mapping.key} phase-1 poses: accumulation moved the map they were '
+            f"written against, and no consumer uses a MAPPING session's trajectory."
+        )
+
     def process_episode(self, scene: SceneContext, episode: Episode) -> None:
         """Phase 2: localize one episode against the atlas built in phase 1."""
         # The mapping session *is* the map, so there is nothing to localize it against — its
-        # own trajectory was already reconciled onto it during the phase-1 build.
+        # own trajectory was already reconciled onto it during the phase-1 build. It is a walk
+        # around the scene, not a demonstration, and DP export skips MAPPING sessions outright,
+        # so localizing it would buy poses nothing consumes.
+        #
+        # Under accumulation its phase-1 poses go stale instead — the map kept growing and
+        # bundle adjustment moved it — so they are dropped rather than re-derived. See
+        # :meth:`_drop_stale_mapping_poses`.
         if episode.key == self._mapping_key:
             return
 
