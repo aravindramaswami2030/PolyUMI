@@ -1,0 +1,3 @@
+name	policy	variant	epochs	batch_size
+sparsh_x	vista	sparsh_x	120	8
+vista	vista	vista	120	8
