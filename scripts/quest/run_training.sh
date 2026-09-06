@@ -50,6 +50,7 @@ PYTHON="$TRAIN_ROOT/envs/$POLICY/bin/python"
 [[ -x "$PYTHON" ]] || { echo "environment is missing: $TRAIN_ROOT/envs/$POLICY" >&2; exit 2; }
 
 RUN_ID="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-manual}}_${SLURM_ARRAY_TASK_ID:-0}"
+STARTED_AT="$(date --iso-8601=seconds)"
 OUTPUT_DIR="${OUTPUT_DIR:-$TRAIN_ROOT/outputs/$DATASET_NAME/$MODEL_NAME/$RUN_ID}"
 mkdir -p "$OUTPUT_DIR" "$TRAIN_ROOT/cache/huggingface" "$TRAIN_ROOT/cache/torch" \
     "$TRAIN_ROOT/cache/numba" "$TRAIN_ROOT/cache/matplotlib"
@@ -66,8 +67,8 @@ WANDB_MODE="${WANDB_MODE:-offline}"
 cd "$POLICY_DIR"
 "$PYTHON" -c 'import torch; assert torch.cuda.is_available(); print("GPU:", torch.cuda.get_device_name(0))'
 
-printf 'policy=%s\ndataset=%s\nvariant=%s\nepochs=%s\nbatch_size=%s\njob_id=%s\n' \
-    "$POLICY" "$DATASET" "$VARIANT" "$EPOCHS" "$BATCH_SIZE" "$RUN_ID" \
+printf 'policy=%s\ndataset=%s\nvariant=%s\nepochs=%s\nbatch_size=%s\njob_id=%s\nstarted_at=%s\n' \
+    "$POLICY" "$DATASET" "$VARIANT" "$EPOCHS" "$BATCH_SIZE" "$RUN_ID" "$STARTED_AT" \
     > "$OUTPUT_DIR/run-metadata.txt"
 
 if [[ "$POLICY" == dp ]]; then
