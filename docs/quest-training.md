@@ -45,22 +45,22 @@ sbatch scripts/quest/train_one.sbatch \
   /projects/p52914/xph8283/polyumi/datasets/task_a.zarr.zip
 ```
 
-Run a two-epoch Vista vision+tactile smoke test:
+Run a two-epoch Vista smoke test:
 
 ```bash
 sbatch scripts/quest/train_one.sbatch \
   vista \
   /projects/p52914/xph8283/polyumi/datasets/task_a_multimodal.zarr.zip \
-  vista_vt
+  vista
 ```
 
 The optional fourth and fifth arguments set epochs and batch size. This example requests 120
-epochs with a batch size of 16:
+epochs with a batch size of 8:
 
 ```bash
 sbatch --time=24:00:00 scripts/quest/train_one.sbatch \
   vista /projects/p52914/xph8283/polyumi/datasets/task_a_multimodal.zarr.zip \
-  vista_vt 120 16
+  vista 120 8
 ```
 
 The single-job script defaults to one A100, 8 CPU cores, 64 GB of RAM, and a two-hour limit.
@@ -102,14 +102,18 @@ become output-directory components, so use letters, numbers, dots, underscores, 
 `models.tsv` has five columns:
 
 ```text
-name       policy  variant                                          epochs  batch_size
-dp_timm    dp      train_diffusion_unet_timm_polyumi_workspace      120     32
-vista_vt   vista   vista_vt                                         120     16
+name            policy  variant                                          epochs  batch_size
+dp_timm         dp      train_diffusion_unet_timm_polyumi_workspace      120     32
+polytouch       vista   polytouch                                        120     4
+see_hear_feel   vista   see_hear_feel                                    120     8
+sparsh_x        vista   sparsh_x                                         120     8
+vista           vista   vista                                            120     8
 ```
 
-Vista variants are `vista`, `touch_in_the_wild`, `see_hear_feel`, `sparsh_x`, `vista_v`,
-`sparsh_x_v`, `vista_vt`, and `touch_in_the_wild_vt`. A DP variant is the name of a YAML file
-under `external/polyumi_diffusion_policy/diffusion_policy/config/`, without `.yaml`.
+Vista variants are `polytouch`, `see_hear_feel`, `sparsh_x`, and `vista`. These correspond to
+the four model-specific YAML files under `external/polyumi_vista_policy/vista/config/`. A DP
+variant is the name of a YAML file under
+`external/polyumi_diffusion_policy/diffusion_policy/config/`, without `.yaml`.
 
 Preview and validate the generated combinations:
 

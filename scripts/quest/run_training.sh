@@ -39,7 +39,7 @@ case "$POLICY" in
     vista)
         POLICY_DIR="$REPO_ROOT/external/polyumi_vista_policy"
         case "$VARIANT" in
-            vista|touch_in_the_wild|see_hear_feel|sparsh_x|vista_v|sparsh_x_v|vista_vt|touch_in_the_wild_vt) ;;
+            polytouch|see_hear_feel|sparsh_x|vista) ;;
             *) echo "unknown Vista model: $VARIANT" >&2; exit 2 ;;
         esac
         ;;

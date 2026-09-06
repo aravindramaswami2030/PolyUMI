@@ -17,7 +17,7 @@ DATASET="${2:?Specify an absolute dataset path}"
 if [[ "$POLICY" == dp ]]; then
     VARIANT="${3:-train_diffusion_unet_timm_polyumi_workspace}"
 else
-    VARIANT="${3:-vista_vt}"
+    VARIANT="${3:-vista}"
 fi
 
 EPOCHS="${4:-2}"
