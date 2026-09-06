@@ -87,7 +87,7 @@ else
     bash scripts/train_day0suite.sh \
         --model "$VARIANT" \
         "hydra.run.dir=$OUTPUT_DIR" \
-        "training.max_epochs=$EPOCHS" \
+        "training.num_epochs=$EPOCHS" \
         training.checkpoint_every=1 \
         "dataloader.batch_size=$BATCH_SIZE" \
         "val_dataloader.batch_size=$BATCH_SIZE" \
