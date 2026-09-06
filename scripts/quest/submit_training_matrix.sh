@@ -15,6 +15,8 @@ Options:
   --cpus N           CPUs per task (default: 8)
   --mem SIZE         Memory per task (default: 64G)
   --wandb-mode MODE  offline, online, or disabled (default: offline)
+  --wandb-entity ID  W&B team/entity (default: cwhayes)
+  --wandb-project ID W&B project (default: polyumi-quest)
   --dry-run          Validate and print the generated matrix without submitting
 EOF
 }
@@ -29,6 +31,8 @@ TIME_LIMIT=02:00:00
 CPUS=8
 MEMORY=64G
 WANDB_MODE=offline
+WANDB_ENTITY="${WANDB_ENTITY:-cwhayes}"
+WANDB_PROJECT="${WANDB_PROJECT:-polyumi-quest}"
 DRY_RUN=0
 
 while [[ $# -gt 0 ]]; do
@@ -43,6 +47,8 @@ while [[ $# -gt 0 ]]; do
         --cpus) CPUS="$2"; shift 2 ;;
         --mem) MEMORY="$2"; shift 2 ;;
         --wandb-mode) WANDB_MODE="$2"; shift 2 ;;
+        --wandb-entity) WANDB_ENTITY="$2"; shift 2 ;;
+        --wandb-project) WANDB_PROJECT="$2"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -129,6 +135,8 @@ fi
 export POLYUMI_TRAIN_ROOT="$TRAIN_ROOT"
 export POLYUMI_REPO_ROOT="$REPO_ROOT"
 export WANDB_MODE
+export WANDB_ENTITY
+export WANDB_PROJECT
 JOB_ID="$(sbatch --parsable \
     --account="$ACCOUNT" --partition="$PARTITION" --gres="$GPU_RESOURCE" \
     --nodes=1 --ntasks=1 --cpus-per-task="$CPUS" --mem="$MEMORY" --time="$TIME_LIMIT" \

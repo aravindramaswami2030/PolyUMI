@@ -138,12 +138,21 @@ The concurrency cap controls GPU use and shared-filesystem pressure; increase it
 allocation and dataset I/O can support more simultaneous runs.
 
 For online Weights & Biases logging, authenticate without placing the key in these files, then
-submit with `--wandb-mode online`:
+submit with `--wandb-mode online`. The launcher defaults to the shared
+[`cwhayes/polyumi-quest`](https://wandb.ai/cwhayes/polyumi-quest) project:
 
 ```bash
 export WANDB_API_KEY='your-key'
 scripts/quest/submit_training_matrix.sh \
   --datasets datasets.tsv --models models.tsv --wandb-mode online
+```
+
+Use `--wandb-entity` or `--wandb-project` to target a different location. For example:
+
+```bash
+scripts/quest/submit_training_matrix.sh \
+  --datasets datasets.tsv --models models.tsv --wandb-mode online \
+  --wandb-entity cwhayes --wandb-project polyumi-quest
 ```
 
 The generated matrix is retained under `manifests/generated/`, giving every array job an exact
