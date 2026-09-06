@@ -181,7 +181,7 @@ PolyUMI trained models/
   DATASET/
     POLICY/
       MODEL/
-        run-JOB_ID_TASK_ID/
+        YYYY-MM-DD_run-JOB_ID_TASK_ID/
           best-epoch=EPOCH-val_loss=LOSS.ckpt
           selection.json
 ```
@@ -189,3 +189,6 @@ PolyUMI trained models/
 The script uses resumable `rsync` transfers when available, verifies every checkpoint's byte
 size, and safely skips a checkpoint that is already present. Pass `--all-runs` to preserve all
 successful 120-epoch runs instead of selecting only the newest run for each combination.
+The run date and start timestamp are also recorded in `best-checkpoints.tsv` and each
+`selection.json`. New training runs record an exact timestamp; older runs use the creation time
+of their `run-metadata.txt` file.

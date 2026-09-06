@@ -19,6 +19,7 @@ import json
 import os
 import re
 import sys
+from datetime import datetime, timezone
 
 root = os.path.realpath(sys.argv[1])
 required_epochs = int(sys.argv[2])
@@ -76,18 +77,27 @@ for current, dirs, files in os.walk(root):
         name,
     ))
     checkpoint = os.path.join(checkpoint_dir, names[0])
+    mtime = os.path.getmtime(meta_path)
+    started_at = metadata.get("started_at")
+    if not started_at:
+        started_at = datetime.fromtimestamp(mtime, timezone.utc).isoformat(timespec="seconds")
+    run_date = started_at[:10]
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", run_date):
+        run_date = datetime.fromtimestamp(mtime, timezone.utc).strftime("%Y-%m-%d")
     print(json.dumps({
         "dataset": dataset,
         "policy": metadata.get("policy", "unknown"),
         "model": model,
         "variant": metadata.get("variant", ""),
         "run_id": run_id,
+        "run_date": run_date,
+        "started_at": started_at,
         "epochs": required_epochs,
         "best_epoch": epoch,
         "val_loss": loss,
         "checkpoint": checkpoint,
         "size": os.path.getsize(checkpoint),
-        "mtime": os.path.getmtime(meta_path),
+        "mtime": mtime,
     }, sort_keys=True))
 '''
 
@@ -162,10 +172,8 @@ def scan_remote(args: argparse.Namespace) -> list[dict]:
 
 
 def copy_checkpoint(args: argparse.Namespace, run: dict) -> Path:
-    output_dir = (
-        args.destination / run["dataset"] / run["policy"] / run["model"]
-        / f"run-{run['run_id']}"
-    )
+    model_dir = args.destination / run["dataset"] / run["policy"] / run["model"]
+    output_dir = model_dir / f"{run['run_date']}_run-{run['run_id']}"
     loss_text = format(run["val_loss"], ".10g")
     target = output_dir / (
         f"best-epoch={run['best_epoch']:04d}-val_loss={loss_text}.ckpt"
@@ -173,6 +181,11 @@ def copy_checkpoint(args: argparse.Namespace, run: dict) -> Path:
     if args.dry_run:
         return target
 
+    legacy_dir = model_dir / f"run-{run['run_id']}"
+    if legacy_dir.is_dir() and not output_dir.exists():
+        output_dir.parent.mkdir(parents=True, exist_ok=True)
+        legacy_dir.rename(output_dir)
+        print(f"Added run date: {legacy_dir} -> {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
     if target.exists() and target.stat().st_size == run["size"]:
         print(f"Already present: {target}")
@@ -202,12 +215,13 @@ def write_manifest(destination: Path, rows: list[tuple[dict, Path]]) -> None:
     destination.mkdir(parents=True, exist_ok=True)
     manifest = destination / "best-checkpoints.tsv"
     lines = [
-        "dataset\tpolicy\tmodel\trun_id\tepoch\tval_loss\tcheckpoint"
+        "dataset\tpolicy\tmodel\trun_date\tstarted_at\trun_id\tepoch\tval_loss\tcheckpoint"
     ]
     for run, target in rows:
         lines.append(
             "\t".join([
-                run["dataset"], run["policy"], run["model"], run["run_id"],
+                run["dataset"], run["policy"], run["model"], run["run_date"],
+                run["started_at"], run["run_id"],
                 str(run["best_epoch"]), repr(run["val_loss"]), str(target),
             ])
         )
