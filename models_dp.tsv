@@ -1,0 +1,2 @@
+name	policy	variant	epochs	batch_size
+dp_timm	dp	train_diffusion_unet_timm_polyumi_workspace	120	32
