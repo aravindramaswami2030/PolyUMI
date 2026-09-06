@@ -1,0 +1,3 @@
+name	path	type
+task_a	/projects/p52914/xph8283/polyumi/datasets/task_a.zarr.zip	dp
+task_b_multimodal	/projects/p52914/xph8283/polyumi/datasets/task_b.zarr.zip	polyumi

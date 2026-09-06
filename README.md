@@ -198,6 +198,9 @@ diffusion policy in Docker on a GPU workstation. See
 [docs/training-instructions.md](docs/training-instructions.md) for the build/run walkthrough,
 the rootless-Docker notes, and how the trained policy is served back to the ROS inference node.
 
+For Northwestern Quest, including single runs and dataset/model Slurm arrays, see
+[docs/quest-training.md](docs/quest-training.md).
+
 ## Inference
 
 ### Streaming Demo
