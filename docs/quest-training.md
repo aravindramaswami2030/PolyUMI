@@ -157,3 +157,35 @@ scripts/quest/submit_training_matrix.sh \
 
 The generated matrix is retained under `manifests/generated/`, giving every array job an exact
 record of the dataset, model, epoch count, and batch size it received.
+
+## Copy the best checkpoints to local storage
+
+Run the checkpoint sync from the local Ubuntu machine where the destination drive is mounted.
+It scans successful Quest runs, considers only checkpoints that have an exact validation loss in
+the run log, and selects the lowest loss. By default, the newest successful run is used for each
+dataset/policy/model combination.
+
+Preview the expected two Sparsh-X, two Vista, and two DP-TIMM checkpoints:
+
+```bash
+python3 scripts/quest/sync_best_checkpoints.py \
+  --destination "/media/anunthramaswami/Seagate Portable Drive/PolyUMI trained models" \
+  --model sparsh_x --model vista --model dp_timm --expect 6 --dry-run
+```
+
+Remove `--dry-run` to copy them. The resulting hierarchy is:
+
+```text
+PolyUMI trained models/
+  best-checkpoints.tsv
+  DATASET/
+    POLICY/
+      MODEL/
+        run-JOB_ID_TASK_ID/
+          best-epoch=EPOCH-val_loss=LOSS.ckpt
+          selection.json
+```
+
+The script uses resumable `rsync` transfers when available, verifies every checkpoint's byte
+size, and safely skips a checkpoint that is already present. Pass `--all-runs` to preserve all
+successful 120-epoch runs instead of selecting only the newest run for each combination.
