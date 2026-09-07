@@ -39,7 +39,7 @@ case "$POLICY" in
     vista)
         POLICY_DIR="$REPO_ROOT/external/polyumi_vista_policy"
         case "$VARIANT" in
-            polytouch|see_hear_feel|sparsh_x|vista) ;;
+            polytouch|see_hear_feel|sparsh_x|vista|vista_vt|vista_va|vista_v) ;;
             *) echo "unknown Vista model: $VARIANT" >&2; exit 2 ;;
         esac
         ;;
@@ -85,8 +85,16 @@ if [[ "$POLICY" == dp ]]; then
         "logging.mode=$WANDB_MODE"
 else
     export DAY0SUITE_DATASET="$DATASET"
+    VISTA_MODEL="$VARIANT"
+    VISTA_ABLATION=()
+    case "$VARIANT" in
+        vista_vt) VISTA_MODEL=vista; VISTA_ABLATION+=(ablation=vt) ;;
+        vista_va) VISTA_MODEL=vista; VISTA_ABLATION+=(ablation=va) ;;
+        vista_v)  VISTA_MODEL=vista; VISTA_ABLATION+=(ablation=v) ;;
+    esac
     bash scripts/train_day0suite.sh \
-        --model "$VARIANT" \
+        --model "$VISTA_MODEL" \
+        "${VISTA_ABLATION[@]}" \
         "hydra.run.dir=$OUTPUT_DIR" \
         "training.num_epochs=$EPOCHS" \
         training.checkpoint_every=5 \

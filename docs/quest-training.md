@@ -110,11 +110,16 @@ polytouch       vista   polytouch                                        120    
 see_hear_feel   vista   see_hear_feel                                    120     8
 sparsh_x        vista   sparsh_x                                         120     8
 vista           vista   vista                                            120     8
+vista_vt        vista   vista_vt                                         120     8
+vista_va        vista   vista_va                                         120     8
+vista_v         vista   vista_v                                          120     8
 ```
 
-Vista variants are `polytouch`, `see_hear_feel`, `sparsh_x`, and `vista`. These correspond to
-the four model-specific YAML files under `external/polyumi_vista_policy/vista/config/`. A DP
-variant is the name of a YAML file under
+Vista variants are `polytouch`, `see_hear_feel`, `sparsh_x`, and `vista`, plus the VisTA
+ablations `vista_vt` (vision+tactile), `vista_va` (vision+audio), and `vista_v` (vision only).
+The base variants correspond to model-specific YAML files under
+`external/polyumi_vista_policy/vista/config/`; the ablations compose the matching Hydra overlay
+from `vista/config/ablation/`. A DP variant is the name of a YAML file under
 `external/polyumi_diffusion_policy/diffusion_policy/config/`, without `.yaml`.
 
 Preview and validate the generated combinations:
