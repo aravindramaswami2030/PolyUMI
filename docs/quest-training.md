@@ -63,7 +63,9 @@ sbatch --time=24:00:00 scripts/quest/train_one.sbatch \
   vista 120 8
 ```
 
-The single-job script defaults to one A100, 8 CPU cores, 64 GB of RAM, and a two-hour limit.
+The single-job and matrix launchers request one generic GPU by default, allowing Slurm to assign
+any GPU model available in the selected partition, including an A100 or H100. They also default to
+8 CPU cores, 64 GB of RAM, and a two-hour per-task limit.
 Any `sbatch` options placed before the script path override those defaults.
 Submit it from the repository root as shown above. If submitting from elsewhere, export
 `POLYUMI_REPO_ROOT=/projects/p52914/xph8283/polyumi/PolyUMI` first.

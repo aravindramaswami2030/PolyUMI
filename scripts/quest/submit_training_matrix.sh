@@ -10,7 +10,7 @@ Options:
   --max-parallel N   Maximum simultaneous GPU jobs (default: 2)
   --account NAME     Slurm account (default: p52914)
   --partition NAME   Slurm partition (default: gengpu)
-  --gpu RESOURCE     Slurm GRES request (default: gpu:a100:1)
+  --gpu RESOURCE     Slurm GRES request (default: gpu:1; any GPU model)
   --time HH:MM:SS    Per-task time limit (default: 02:00:00)
   --cpus N           CPUs per task (default: 8)
   --mem SIZE         Memory per task (default: 64G)
@@ -26,7 +26,7 @@ MODELS_FILE=""
 MAX_PARALLEL=2
 ACCOUNT=p52914
 PARTITION=gengpu
-GPU_RESOURCE=gpu:a100:1
+GPU_RESOURCE=gpu:1
 TIME_LIMIT=02:00:00
 CPUS=8
 MEMORY=64G
