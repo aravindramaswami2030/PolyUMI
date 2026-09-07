@@ -172,6 +172,11 @@ It scans successful Quest runs, considers only checkpoints that have an exact va
 the run log, and selects the lowest loss. By default, the newest successful run is used for each
 dataset/policy/model combination.
 
+VisTA-family training evaluates the best-checkpoint candidate after every validation epoch and
+retains one lowest-loss checkpoint. Numbered recovery checkpoints and `latest.ckpt` remain on the
+`training.checkpoint_every` schedule (five epochs in the Quest launcher). This preserves an exact
+validation minimum without returning to an every-epoch recovery-checkpoint schedule.
+
 Preview the expected two Sparsh-X, two Vista, and two DP-TIMM checkpoints:
 
 ```bash
