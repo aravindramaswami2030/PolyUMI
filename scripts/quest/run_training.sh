@@ -77,7 +77,7 @@ if [[ "$POLICY" == dp ]]; then
         "task.dataset_path=$DATASET" \
         "hydra.run.dir=$OUTPUT_DIR" \
         "training.num_epochs=$EPOCHS" \
-        training.checkpoint_every=1 \
+        training.checkpoint_every=5 \
         "dataloader.batch_size=$BATCH_SIZE" \
         "val_dataloader.batch_size=$BATCH_SIZE" \
         "dataloader.num_workers=${DATALOADER_WORKERS:-4}" \
@@ -89,7 +89,7 @@ else
         --model "$VARIANT" \
         "hydra.run.dir=$OUTPUT_DIR" \
         "training.num_epochs=$EPOCHS" \
-        training.checkpoint_every=1 \
+        training.checkpoint_every=5 \
         "dataloader.batch_size=$BATCH_SIZE" \
         "val_dataloader.batch_size=$BATCH_SIZE" \
         "dataloader.num_workers=${DATALOADER_WORKERS:-4}" \

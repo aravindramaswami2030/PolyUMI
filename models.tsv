@@ -1,5 +1,5 @@
 name	policy	variant	epochs	batch_size
-polytouch	vista	polytouch	120	4
 see_hear_feel	vista	see_hear_feel	120	8
 sparsh_x	vista	sparsh_x	120	8
 vista	vista	vista	120	8
+dp_timm	dp	train_diffusion_unet_timm_polyumi_workspace	120	32
