@@ -57,18 +57,28 @@
       # calibrated 2026-08-11 on the crb's fr3 arm setup.
       gopro: 0.1087
 
-      # Finger camera latency. Declared but never consumed — the policy has no tactile input
-      # yet (see "What's left" in docs/franka-inference-bringup.md). Left at 0 so it cannot skew
-      # anything until it is wired.
+      # Finger camera latency. CONSUMED when send_tactile is on: it shifts the instant the
+      # finger frame is chosen for, exactly as gopro does for the wrist frame.
       #
       # Unmeasured, and measuring it needs a rig: the span from photon to ROS header stamp
       # covers the Pi's sensor, JPEG encode, ZMQ hop and receive loop, none of which is
       # observable from inside the node.
+      #
+      # 0.0 is defensible rather than merely unset. The finger camera runs at 10 fps, so one
+      # frame period (100 ms) already dwarfs any plausible transport delay, and the export it has
+      # to match picks the NEAREST frame on a ~30 Hz grid — a tolerance of the same order. A wrong
+      # non-zero value would bias the choice toward a stale frame with false precision; 0 keeps
+      # the node taking the newest frame at or before the observation instant, which is the
+      # closest an inference-time lookup can get to what the export did.
       finger_cam: 0.0
-      # Piezo mic latency. Same status as finger_cam: unwired, unmeasured, 0 until it is both.
-      # The Pi already removes the capture buffer's occupancy from the stamp
-      # (polyumi_pi/clock.py), so this covers the codec's own conversion delay, transport, and
-      # the receive loop.
+      # Piezo mic latency. Same status: consumed when send_tactile is on, shifting the instant
+      # the mic_0 window ends at. The Pi already removes the capture buffer's occupancy from the
+      # stamp (polyumi_pi/clock.py), so this covers the codec's own conversion delay, transport,
+      # and the receive loop.
+      #
+      # 0.0 for the same reason as finger_cam, with more headroom: one mic_0 row is 33.5 ms and
+      # the policy sees ten of them, so the window is ~0.33 s wide. A transport delay well under
+      # one row shifts the window by a fraction of its span.
       piezo_mic: 0.0
       # Delay from the arm's true EE pose to its measurement appearing on TF.
       #
@@ -148,8 +158,67 @@
     gripper_max_width_m: 0.0812
     gripper_min_width_m: 0.0
 
+    # --- Tactile channels: the finger camera and the contact mic. ---
+    # OFF by default, so a visuomotor policy (POLICY=dp) is served exactly as it was before these
+    # existed — it requires neither channel and sending them would only cost bandwidth. Turn on
+    # for the Vista family (vista, sparsh_x, polytouch, see_hear_feel), every member of which
+    # indexes obs['finger_rgb'] and obs['mic_0'] unconditionally.
+    #
+    # Both channels are all-or-nothing per request: if either is missing or stale the tick is
+    # skipped rather than a partial frame sent, because the wire format refuses per-channel
+    # omission server-side (see polyumi_inference.types.Observation.require).
+    send_tactile: false
+    # The /pi prefix is the launch file's namespace for pi_receiver_node, which publishes
+    # these under relative names. Without it these resolve to topics nothing publishes and
+    # every tick is skipped for "tactile channels incomplete" -- valid-looking and silent.
+    finger_image_topic: /pi/camera/image/compressed
+    audio_topic: /pi/audio/raw
+
+    # Rows of mic_0 per request — the policy's `audio_obs_horizon`.
+    #
+    # THIS MUST MATCH THE CHECKPOINT and nothing downstream can catch it being wrong: a window of
+    # the wrong length is a perfectly valid frame that the policy was simply never trained on. 10
+    # is the Vista fork's current shared contract (10 x 536 samples = ~0.33 s; see its
+    # docs/SENSOR_PROCESSING.md). A checkpoint trained before that alignment wants 17. The node
+    # logs the resolved value at startup for exactly this reason.
+    n_audio_rows: 17
+
+    # The finger_rgb crop. THIS IS THE CONTRACT: a policy trained on one crop cannot be served
+    # frames from another. These mirror ingest/config/finger_camera.yaml, where the provenance of
+    # x_min=170 is written down — it is the first column of the 1152x648 view that is entirely
+    # image rather than the gripper mount or the lens blur across its edge, measured over 9
+    # episodes in 3 scenes. -1 means "the frame's own edge", standing in for that file's `null`,
+    # so the geometry survives a change of camera resolution.
+    #
+    # The node crops and does NOT resize, matching what the exporter STORES; the square-crop and
+    # resize to the encoder's input size is the policy dataset's job at load time.
+    finger_crop:
+      x_min: 170
+      x_max: -1
+      y_min: 0
+      y_max: -1
+
+    # Largest age of the finger frame chosen for a step, in seconds. 0.3 is three periods of the
+    # 10 fps camera. The delivered finger-frame rate on this rig sits below nominal, and a bound
+    # tight enough to match the export skips most ticks outright ("tactile channels incomplete"),
+    # which costs an eval far more than the extra staleness does. The export's own bound is 0.15,
+    # so a frame admitted here can be older than any the training data contained — the price of
+    # running at all, and worth stating when a rollout is judged.
+    #
+    # One asymmetry no bound can remove: the export picks the NEAREST frame, which may sit up to
+    # half a period in the FUTURE of the step. Inference can only look backwards, so the same
+    # bound admits a slightly older frame here than it did there. Unfixable — that future does not
+    # exist at inference — and recorded so a rollout's staleness is judged against the right
+    # baseline.
+    max_finger_age_s: 0.3
+
     buffers:
       # How far back (seconds) the EE-pose TF buffer retains history, so a past pose can
       # still be looked up/interpolated to align with a delayed observation (e.g. the gopro
       # frame). Must be >= the largest latency above that gets compensated for.
       ee_pose_s: 1.0
+
+      # Seconds of piezo audio retained. Must exceed n_audio_rows * 33.5 ms plus the largest
+      # latency compensated for, or the mic_0 window runs off the start of the ring and is
+      # silently zero-padded. 2.0 is ~6x the 10-row window.
+      piezo_s: 2.0

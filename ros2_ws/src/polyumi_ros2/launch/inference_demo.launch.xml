@@ -51,6 +51,13 @@
   <!-- Inference-loop config: receding-horizon stride + per-component system latencies. -->
   <arg name="inference_config" default="$(find-pkg-share polyumi_ros2)/config/inference.yaml"/>
 
+  <!-- Tactile channels. false serves a visuomotor policy (dp); true adds finger_rgb and mic_0 for
+       the Vista family. Must match the server's SERVE_TACTILE. -->
+  <arg name="send_tactile" default="false"/>
+  <!-- Rows of mic_0 per request. MUST match the checkpoint's audio_obs_horizon: 17 for a
+       checkpoint trained before the fork's shared-audio alignment, 10 after it. -->
+  <arg name="n_audio_rows" default="17"/>
+
   <include file="$(find-pkg-share polyumi_ros2)/launch/stream_demo.launch.xml">
     <arg name="pi_host" value="$(var pi_host)"/>
     <arg name="video_device" value="$(var video_device)"/>
@@ -67,5 +74,14 @@
     <param name="post_timeout_s" value="$(var post_timeout_s)"/>
     <param name="tf_use_latest" value="$(var tf_use_latest)"/>
     <param from="$(var inference_config)"/>
+    <!-- AFTER the config file on purpose: later params win in ROS 2 launch, so these two are the
+         only way to steer them per run without editing inference.yaml. Which policy is being
+         served decides both, and the answer changes between one rollout and the next.
+
+         Defaults mirror inference.yaml, so omitting them changes nothing. send_tactile must match
+         the server's SERVE_TACTILE, and n_audio_rows must match the checkpoint's
+         audio_obs_horizon — neither is detectable at runtime, so both are logged at startup. -->
+    <param name="send_tactile" value="$(var send_tactile)"/>
+    <param name="n_audio_rows" value="$(var n_audio_rows)"/>
   </node>
 </launch>

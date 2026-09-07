@@ -370,7 +370,11 @@ def stream(
     audio_port: int = typer.Option(5556, help='ZMQ PUSH port for audio.'),
     sample_rate: int = typer.Option(16000, help='Audio sample rate (Hz).'),
     chunk_ms: int = typer.Option(20, help='Audio chunk size (ms).'),
-    channels: int = typer.Option(1, help='Number of audio channels.'),
+    # Stereo, matching record-episode: the mic_0 contract is L=piezo, R=air, and a mono capture
+    # is refused by both the pzarr builder and policy_client_node rather than being read as
+    # channel 0 of an unknown microphone. A live inference run needs the same stream a recorded
+    # episode does.
+    channels: int = typer.Option(2, help='Number of audio channels.'),
     led_brightness: float = typer.Option(
         DEFAULT_BRIGHTNESS, min=0.0, max=1.0, help='LED strip PWM duty cycle, in [0.0, 1.0].'
     ),
