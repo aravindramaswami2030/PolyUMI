@@ -1,3 +1,4 @@
 name	path	type
 ethernet	/projects/p52914/xph8283/polyumi/datasets/ethernet_v1_no_load_cell_polyumi.zarr.zip	polyumi
 gears	/projects/p52914/xph8283/polyumi/datasets/gears_v1_polyumi.zarr.zip	polyumi
+lightbulb	/projects/p52914/xph8283/polyumi/datasets/light_bulb_v1_polyumi.zarr.zip	polyumi
