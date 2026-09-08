@@ -181,7 +181,7 @@
     # is the Vista fork's current shared contract (10 x 536 samples = ~0.33 s; see its
     # docs/SENSOR_PROCESSING.md). A checkpoint trained before that alignment wants 17. The node
     # logs the resolved value at startup for exactly this reason.
-    n_audio_rows: 17
+    n_audio_rows: 10
 
     # The finger_rgb crop. THIS IS THE CONTRACT: a policy trained on one crop cannot be served
     # frames from another. These mirror ingest/config/finger_camera.yaml, where the provenance of
