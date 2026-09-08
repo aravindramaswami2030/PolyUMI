@@ -97,6 +97,9 @@ DIAG_METRICS = (
     'inference_model_s',
     'inference_overhead_s',
     'image_age_s',
+    # The finger camera's counterpart to image_age_s. Its transport runs an order of magnitude
+    # behind the wrist camera's, so it is the stream most likely to be the one that stalled.
+    'finger_age_s',
     'gripper_state_age_s',
     'gripper_width_m',
 )
@@ -325,6 +328,10 @@ class PolicyClientNode(Node):
         # The finger slot is None whenever send_tactile is off, so a visuomotor run carries
         # the same tuple shape rather than two buffer layouts to keep straight.
         self._obs_buffer: deque = deque(maxlen=self._n_obs_steps)
+        # (stamp, resized frame) history for the wrist camera, for the same reason as
+        # _finger_history. The frames are already resized to 224x224 here, so a couple of seconds
+        # at 60 Hz costs a few MB, not the hundreds a raw-frame history would.
+        self._image_history: deque = deque(maxlen=max(8, int(self._ee_pose_buffer_s * 70)))
         # Receding-horizon stride counter: inference runs on the tick where this is 0, then
         # every steps_per_inference ticks after. Kept in [0, steps_per_inference) so it never
         # grows. Starts at 0 so the first full-buffer tick infers immediately.
@@ -355,6 +362,11 @@ class PolicyClientNode(Node):
         self._latest_finger: np.ndarray | None = None
         self._latest_finger_stamp: rclpy.time.Time | None = None
         self._latest_finger_lock = threading.Lock()
+        # (stamp, frame) history, newest last. Only the newest frame is needed while the wrist
+        # camera sets the observation instant; once the slowest stream sets it instead, the frame
+        # wanted is the one captured THEN, which is several frames back. Sized from the buffer
+        # window rather than a frame count so it holds the same span at any capture rate.
+        self._finger_history: deque = deque(maxlen=max(4, int(self._ee_pose_buffer_s * 30)))
         # Piezo audio as one flat ring: a deque of blocks would need re-concatenating on every
         # tick, and the window is a plain slice of a contiguous buffer. `_piezo_end_ns` is the
         # capture time one sample PAST the last one held, which is what turns an observation
@@ -656,6 +668,7 @@ class PolicyClientNode(Node):
         # is bit-identical to doing it here. See _control_tick's payload note.
         with self._latest_image_lock:
             self._latest_image = resized
+            self._image_history.append((rclpy.time.Time.from_msg(msg.header.stamp), resized))
             # Keep the frame's own stamp: the pose lookup must align to when THIS frame was
             # captured, not to when the control tick happens to run. The camera publishes at
             # 60 Hz while the tick runs at control_hz, so a cached frame is already up to one
@@ -678,6 +691,7 @@ class PolicyClientNode(Node):
         with self._latest_finger_lock:
             self._latest_finger = frame
             self._latest_finger_stamp = rclpy.time.Time.from_msg(msg.header.stamp)
+            self._finger_history.append((self._latest_finger_stamp, frame))
 
     def _audio_cb(self, msg: RawAudio) -> None:
         """Append one piezo block to the ring, tracking the capture time of its far end."""
@@ -712,23 +726,52 @@ class PolicyClientNode(Node):
                 self._piezo = self._piezo[-self._piezo_capacity :]
             self._piezo_end_ns = start_ns + int(round(block.size * 1e9 / MIC0_SAMPLE_RATE_HZ))
 
-    def _finger_at(self, stamp: rclpy.time.Time) -> np.ndarray | None:
+    @staticmethod
+    def _frame_at(history: deque, capture_instant: rclpy.time.Time, latency_s: float):
         """
-        Return the newest finger frame at or before ``stamp``, or ``None`` if too stale.
+        Newest (stamp, frame) in ``history`` captured at or before ``capture_instant``.
 
-        Backwards-only, unlike the export, which takes the nearest frame and so may reach half a
-        period forward. That asymmetry is unavoidable at inference and is why
-        ``max_finger_age_s`` admits an older frame here than the same number did at export.
+        ``history`` holds publish stamps; a frame's capture instant is ``stamp - latency_s``.
+        Backwards-only, and returns None when the whole history is newer than the instant asked
+        for -- that means the stream had not yet produced the frame, and holding the next-newest
+        would pair the policy with the future.
         """
-        with self._latest_finger_lock:
-            frame, frame_stamp = self._latest_finger, self._latest_finger_stamp
-        if frame is None or frame_stamp is None:
+        cutoff = capture_instant + Duration(seconds=latency_s)
+        best = None
+        for stamp, frame in history:
+            if stamp <= cutoff:
+                best = (stamp, frame)
+            else:
+                break
+        return best
+
+    def _observation_instant(self) -> rclpy.time.Time | None:
+        """
+        Return the newest instant every enabled stream covers: the oldest of their newest samples.
+
+        An observation is only as fresh as its slowest stream, so the minimum is what makes every
+        channel describe the same moment -- at the cost of that moment being slightly older. The
+        margin is not academic: the finger camera's transport runs ~150 ms behind the GoPro's
+        (measured over the USB gadget link), which is more than one finger-camera frame period.
+        """
+        with self._latest_image_lock:
+            image_stamp = self._latest_image_stamp
+        if image_stamp is None:
             return None
-        age = (stamp - frame_stamp).nanoseconds / 1e9
-        if age > self._max_finger_age_s:
-            self._warn_throttled(f'Finger frame {age:.3f}s stale (limit {self._max_finger_age_s}s)')
-            return None
-        return frame
+        instants = [image_stamp - Duration(seconds=self._latency['gopro'])]
+        if self._send_tactile:
+            with self._latest_finger_lock:
+                finger_stamp = self._latest_finger_stamp
+            if finger_stamp is None:
+                return None
+            instants.append(finger_stamp - Duration(seconds=self._latency['finger_cam']))
+            with self._piezo_lock:
+                piezo_end_ns = self._piezo_end_ns
+            if piezo_end_ns is None:
+                return None
+            piezo_end = rclpy.time.Time(nanoseconds=piezo_end_ns)
+            instants.append(piezo_end - Duration(seconds=self._latency['piezo_mic']))
+        return min(instants, key=lambda t: t.nanoseconds)
 
     def _mic0_channel(self, stamp: rclpy.time.Time) -> np.ndarray | None:
         """Cut the ``mic_0`` window ending at ``stamp``, or ``None`` if no audio has arrived."""
@@ -834,13 +877,17 @@ class PolicyClientNode(Node):
         Never blocks on the network: the request itself is issued by _inference_worker, so a slow
         round trip costs a superseded observation rather than the control ticks that ran during it.
         """
-        # --- 1. Get latest image ---
-        with self._latest_image_lock:
-            image = self._latest_image
-            image_stamp = self._latest_image_stamp
-        if image is None or image_stamp is None:
-            self._warn_throttled('Waiting for first camera image')
+        # --- 1. Pick the instant every stream can cover, then sample them all at it ---
+        t_obs = self._observation_instant()
+        if t_obs is None:
+            self._warn_throttled('Waiting for first frame on every enabled stream')
             return
+        with self._latest_image_lock:
+            picked = self._frame_at(self._image_history, t_obs, self._latency['gopro'])
+        if picked is None:
+            self._warn_throttled('No wrist frame at the observation instant')
+            return
+        image_stamp, image = picked
 
         # Guard against pairing a stale frame with a fresh pose (see _max_image_age_s).
         image_age_s = (self.get_clock().now() - image_stamp).nanoseconds * 1e-9
@@ -854,17 +901,32 @@ class PolicyClientNode(Node):
             )
             return
 
-        # --- 2. Get EEF pose from TF, aligned to this frame's capture instant ---
+        # --- 2. Get EEF pose from TF, aligned to that same instant ---
         agent_pos = self._lookup_agent_pos(image_stamp)
         if agent_pos is None:
             return  # warning already logged inside
 
         # --- 3. Append to history buffer ---
-        # The finger frame is sampled at the wrist frame's instant, not the tick's: the two
+        # The finger frame is sampled at the shared observation instant, not the tick's: the two
         # cameras share the observation timeline the sampler built at training ("same instants as
         # wrist"). None when tactile is off, or when no frame is fresh enough — checked below,
         # once the window is full, so a startup gap reads as "filling" rather than as a fault.
-        finger = self._finger_at(image_stamp) if self._send_tactile else None
+        finger = None
+        if self._send_tactile:
+            with self._latest_finger_lock:
+                found = self._frame_at(self._finger_history, t_obs, self._latency['finger_cam'])
+            if found is not None:
+                finger_stamp, candidate = found
+                # Aged against now, exactly as the wrist frame is, because this guard exists to
+                # catch a stalled stream. Measuring against t_obs instead would compare the finger
+                # camera to an instant it usually sets itself -- it is the slowest stream, so that
+                # gap is near zero however long the camera has been dead.
+                age = (self.get_clock().now() - finger_stamp).nanoseconds / 1e9
+                self._diag('finger_age_s', age)
+                if age > self._max_finger_age_s:
+                    self._warn_throttled(f'Finger frame {age:.3f}s stale (limit {self._max_finger_age_s}s)')
+                else:
+                    finger = candidate
         self._obs_buffer.append((image, agent_pos, finger))
         if len(self._obs_buffer) < self._n_obs_steps:
             self._warn_throttled(f'Observation buffer filling ({len(self._obs_buffer)}/{self._n_obs_steps})')
@@ -901,7 +963,7 @@ class PolicyClientNode(Node):
             # rather than letting a modality reach the model as absent. Skipping the tick is the
             # honest failure — the next one may have the data.
             fingers = [entry[2] for entry in self._obs_buffer]
-            mic = self._mic0_channel(image_stamp - Duration(seconds=self._latency['piezo_mic']))
+            mic = self._mic0_channel(t_obs + Duration(seconds=self._latency['piezo_mic']))
             if any(frame is None for frame in fingers) or mic is None:
                 self._warn_throttled('Skipping inference: tactile channels incomplete this tick')
                 return
@@ -913,8 +975,8 @@ class PolicyClientNode(Node):
             n_obs_steps=self._n_obs_steps,
             n_action_steps=self._n_action_steps,
         )
-        # t_obs: when this frame was actually captured, i.e. the instant action[0] targets.
-        self._submit_inference(obs, image_stamp - Duration(seconds=self._latency['gopro']))
+        # t_obs: the instant every channel above describes, i.e. what action[0] targets.
+        self._submit_inference(obs, t_obs)
 
     def _lookup_agent_pos(self, image_stamp: rclpy.time.Time) -> np.ndarray | None:
         """

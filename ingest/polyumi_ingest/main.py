@@ -796,6 +796,16 @@ def export_mcap(
         min=1,
         help='Number of audio samples per RawAudio message.',
     ),
+    gopro_video: bool = typer.Option(
+        True,
+        '--gopro-video/--no-gopro-video',
+        help='Include the /gopro/image channel. The wrist video re-encodes to ~275 MB per '
+        'episode, dwarfing every other channel; --no-gopro-video keeps GoPro audio and IMU.',
+    ),
+    skip_mapping: bool = typer.Option(
+        False,
+        help='Skip MAPPING sessions (long scene scans with no demonstration in them).',
+    ),
 ):
     """Export a pzarr scene to MCAP files for visualization in Foxglove."""
     from polyumi_ingest.export.mcap import export_scene_to_mcap
@@ -807,6 +817,8 @@ def export_mcap(
             episode=episode,
             jpeg_quality=jpeg_quality,
             audio_chunk_size=audio_chunk_size,
+            include_gopro_video=gopro_video,
+            skip_mapping=skip_mapping,
         )
     except FileNotFoundError as e:
         log.error(str(e))

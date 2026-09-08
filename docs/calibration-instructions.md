@@ -235,7 +235,7 @@ empirically on every tick by `_n_stale_actions`, which runs *after* the response
 | `latency.gripper` | printed by the gripper run; half the joint-state publish interval |
 | `latency.proprio` | adopted constant, ~0.001 — see below |
 | round trip | nothing to do; measured live |
-| `latency.finger_cam`, `latency.piezo_mic` | deferred, and blocked — see below |
+| `latency.finger_cam`, `latency.piezo_mic` | see below — the QR rig does not apply |
 
 Everything is measured by one node with three modes:
 
@@ -372,11 +372,26 @@ measurement taken against the wrong one is not merely stale, it is meaningless.
   it is ~1 ms; UMI hit the identical wall and hardcodes `robot_obs_latency: 0.0001`. The `arm_exec`
   measurement returns `arm_exec + proprio`, and at 1 ms that is well inside its own noise floor.
   Building a rig to split them is not worth it.
-- **`latency.finger_cam` and `latency.piezo_mic` are unmeasured.** Neither stream is subscribed by
-  the inference path yet, so neither value is consumed. Measuring either needs a rig: the span
-  from photon (or contact) to ROS header stamp is not observable from inside the node. **Both
-  depend on the Pi being chrony-synced to the ROS host** — see "Clock sync" in
-  [pi-provisioning.md](pi-provisioning.md).
+- **The QR rig cannot measure `latency.finger_cam`.** The finger camera is mounted looking at the
+  tactile sensing surface inside the gripper, so it cannot film a screen; `mode:=camera` needs the
+  camera pointed at the code. What is observable instead is the span from the Pi's header stamp to
+  arrival on the ROS host, and for this camera that span is most of the delay: the Pi stamps at
+  capture (`polyumi_pi/clock.py` even subtracts the audio buffer's occupancy), so JPEG encode, the
+  ZMQ hop, the link and the receive loop all land after the stamp. Only sensor readout escapes it.
+  Measure with `ros2 topic delay <topic>`, one topic at a time -- a probe that subscribes to
+  several at once measures its own backlog, since rclpy deserialises in Python and cannot keep up
+  with 60 Hz of 1080p.
+- **Measured 2026-09-08 over the USB gadget link**, Pi chrony-synced to lamb at +40 us:
+  `/pi/camera/image/compressed` **161 ms** (min 141, max 178, sd 10.7);
+  `/gopro/image_raw/compressed` **10 ms** (min 9, max 17, sd 0.45). So the finger camera's
+  transport runs ~150 ms behind the wrist camera's, which is more than one finger-camera frame
+  period at 10 fps. Re-measure on WiFi if inference ever runs over it; the numbers will differ.
+- **This is why `policy_client_node` takes the oldest capture instant across streams** rather than
+  the wrist camera's alone -- see `_observation_instant`. It is not a config constant: pairing the
+  newest frame from each stream would skew the tactile channels ~150 ms against the wrist image no
+  matter what `latency.finger_cam` is set to.
+- **`latency.piezo_mic` is still unmeasured.** It needs an acoustic equivalent of the QR rig: a
+  known-time impulse the mic can hear, cross-correlated against its onset in `/pi/audio/raw`.
 - **Don't run any probe mode while `policy_client_node` is up.** The arm and gripper modes publish to
   the same topics the policy does, and the bridges act on whichever chunk arrived last.
 - **Monitor scanout is inside `latency.gopro`.** The probe subtracts its own render time but cannot
