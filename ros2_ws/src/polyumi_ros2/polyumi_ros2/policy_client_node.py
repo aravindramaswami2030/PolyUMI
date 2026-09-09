@@ -245,6 +245,23 @@ class PolicyClientNode(Node):
         # requires neither channel, and sending them would only cost bandwidth. Turn on for the
         # Vista family, every member of which indexes obs['finger_rgb'] and obs['mic_0']
         # unconditionally — see the fork's docs/SENSOR_PROCESSING.md.
+        # TEMPORARY (branch gripper_only_hold). Freeze the arm and let only the gripper act: every
+        # action's pose half is replaced with the arm's CURRENT pose before publishing, so the
+        # commanded trajectory is a constant "stay here" while the gripper channel passes through
+        # untouched. For evaluating a policy whose pose output is not trusted -- e.g. one trained on
+        # a buffer with stub poses, where nine of ten action dims are meaningless -- without the arm
+        # acting on it. Overwriting beats simply not publishing: the arm is actively held at a known
+        # pose rather than left to whatever the controller does when its chunk stream stops.
+        self.declare_parameter('gripper_only', False)
+        # TEMPORARY (branch gripper_only_hold). Omit camera0_rgb from the request, so the model is
+        # given only the tactile channels and the gripper width. For a gripper-only checkpoint
+        # whose shape_meta declares no camera0_rgb, sending it is dead weight -- and it is by far
+        # the largest thing on the wire, so dropping it is most of the request.
+        #
+        # The GoPro is still REQUIRED to run: its frame stamp is what _observation_instant anchors
+        # on, and agent_pos is still sent because the gripper width rides in its last column
+        # (the server derives robot0_gripper_width from agent_pos[:, 7:8]) and /reset needs a pose.
+        self.declare_parameter('send_camera0', True)
         self.declare_parameter('send_tactile', False)
         self.declare_parameter('finger_image_topic', '/pi/camera/image/compressed')
         self.declare_parameter('audio_topic', '/pi/audio/raw')
@@ -358,6 +375,8 @@ class PolicyClientNode(Node):
         self._gripper_buffer: deque = deque(maxlen=max(8, int(self._ee_pose_buffer_s * 40)))
 
         # --- Tactile state (only populated when send_tactile is on) ---
+        self._gripper_only = self.get_parameter('gripper_only').get_parameter_value().bool_value
+        self._send_camera0 = self.get_parameter('send_camera0').get_parameter_value().bool_value
         self._send_tactile = self.get_parameter('send_tactile').get_parameter_value().bool_value
         self._n_audio_rows = self.get_parameter('n_audio_rows').get_parameter_value().integer_value
         self._max_finger_age_s = self.get_parameter('max_finger_age_s').get_parameter_value().double_value
@@ -442,6 +461,9 @@ class PolicyClientNode(Node):
         self._client = PolicyClient(self._url, timeout_s=self._post_timeout_s)
         self._reset_url = self._client.reset_url
         self._episode_reset_done = False
+        # Latched hold pose for gripper_only. Captured once, on the first chunk of an episode, and
+        # reused verbatim after that.
+        self._hold_pose = None
 
         # Diagnostics. Always on: ten Float32s at the control rate is nothing next to the image
         # traffic already on the wire, and the failures these catch are exactly the ones you only
@@ -964,9 +986,10 @@ class PolicyClientNode(Node):
         # Images stay uint8 all the way from _image_cb: that is the dtype the dataset stores, and
         # the server's /255 reproduces the old float32 payload exactly at a quarter of the bytes.
         channels = {
-            'camera0_rgb': np.stack([entry[0] for entry in self._obs_buffer]),
             'agent_pos': np.stack([entry[1] for entry in self._obs_buffer]),
         }
+        if self._send_camera0:
+            channels['camera0_rgb'] = np.stack([entry[0] for entry in self._obs_buffer])
         if self._send_tactile:
             # Both tactile channels are all-or-nothing for a request: the Vista family indexes
             # them unconditionally, and the wire format deliberately refuses a partial frame
@@ -1131,6 +1154,32 @@ class PolicyClientNode(Node):
             )
         return robot_to_policy_width(width, self._gripper_min_width_m)
 
+    def _freeze_arm(self, actions: np.ndarray, obs: Observation) -> np.ndarray:
+        """
+        Replace every action's pose with a LATCHED hold pose, leaving the gripper untouched.
+
+        The pose is latched at ``/reset`` -- where the arm was placed to start the episode -- and
+        every chunk is commanded to that same pose. Re-reading the current pose each tick instead makes the target
+        follow the arm's own measurement noise and small settling motions, and the arm chases it --
+        observed as the arm shaking the moment the policy starts. A latched target cannot drift,
+        so the arm holds exactly where it was when the run began.
+
+        Applied before the preview publishers, so what Foxglove shows is what will be commanded --
+        a preview of the policy's real pose output would be actively misleading here.
+
+        Actions and ``agent_pos`` share the layout ``[x, y, z, qx, qy, qz, qw, gripper]``, so this
+        is a slice assignment over the first seven columns.
+        """
+        if self._hold_pose is None:
+            # Only reachable if a chunk is processed before /reset succeeded, which _control_tick
+            # is supposed to prevent. Falling back to the observation keeps the arm frozen rather
+            # than letting the policy's untrusted poses through, which is the safer failure.
+            self._hold_pose = np.asarray(obs['agent_pos'], dtype=np.float64)[-1, :7].copy()
+            self._warn_throttled('gripper_only: no /reset pose latched yet; holding at the observed pose')
+        frozen = np.array(actions, copy=True)
+        frozen[:, :7] = self._hold_pose
+        return frozen
+
     def _n_stale_actions(self, t_obs: rclpy.time.Time, latency_act: float) -> int:
         """
         Count the leading actions in a chunk that are already in the past by execution time.
@@ -1176,6 +1225,17 @@ class PolicyClientNode(Node):
             self._warn_throttled('episode /reset failed; server will approximate wrt_start with the current pose')
             return
         self._episode_reset_done = True
+        # Latch the gripper_only hold pose here, at the episode start, rather than off the first
+        # chunk's observation: this is the pose the arm was placed at and is being held at before
+        # the policy contributes anything, so holding it commands no correction. Taking it from the
+        # first chunk instead re-anchors to wherever the arm had drifted by the time inference
+        # returned, which is a small commanded move at the exact moment the run starts.
+        if self._gripper_only:
+            self._hold_pose = np.asarray(agent_pos, dtype=np.float64)[:7].copy()
+            self.get_logger().info(
+                f'gripper_only: holding arm at x={self._hold_pose[0]:.4f} '
+                f'y={self._hold_pose[1]:.4f} z={self._hold_pose[2]:.4f} for this episode'
+            )
         # Chunks from before the reset describe an arm that has since been moved back to a start
         # pose, so blending them into the new episode's first chunks would drag the target there.
         self._ensembler.reset()
@@ -1288,6 +1348,8 @@ class PolicyClientNode(Node):
         # the preview topic shows what will actually be commanded rather than the raw prediction.
         # Returns the chunk untouched when disabled or when nothing overlaps it.
         actions = self._ensembler.blend(t_obs.nanoseconds * 1e-9, chunk.actions)
+        if self._gripper_only:
+            actions = self._freeze_arm(actions, obs)
         latency_model_s = None if chunk.model_ms is None else chunk.model_ms * 1e-3
 
         # Viz-only preview: publish the full commanded chunk (before the stale-drop below) so the

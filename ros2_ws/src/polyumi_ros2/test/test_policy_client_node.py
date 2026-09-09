@@ -1261,3 +1261,64 @@ def test_finger_output_size_is_applied_to_the_decoded_frame(make_node):
     node._finger_cb(msg)
 
     assert node._latest_finger.shape[:2] == (224, 224)
+
+
+def test_gripper_only_defaults_off(make_node):
+    """The arm-freeze is opt-in: a normal run must command the policy's poses unchanged."""
+    node = make_node()
+    assert node._gripper_only is False
+
+
+def test_gripper_only_replaces_poses_but_keeps_the_gripper(make_node):
+    """
+    Every commanded pose becomes the held pose; the gripper channel passes through.
+
+    This is the whole point of the mode -- evaluating a policy whose pose output is not trusted
+    while still letting it drive the hand. If the gripper were frozen too the run would command
+    nothing; if the poses survived, the arm would act on output known to be meaningless.
+    """
+    node = make_node(gripper_only=True)
+    assert node._gripper_only is True
+
+    held = np.array([0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0, 0.055])
+    obs = Observation(channels={'agent_pos': np.stack([held * 0.5, held])}, n_obs_steps=2, n_action_steps=8)
+    actions = np.tile(np.array([9.0, 9.0, 9.0, 1.0, 0.0, 0.0, 0.0, 0.031]), (4, 1))
+
+    frozen = node._freeze_arm(actions, obs)
+
+    assert np.allclose(frozen[:, :7], held[:7]), 'every pose must become the held pose'
+    assert np.allclose(frozen[:, 7], 0.031), 'the gripper command must survive untouched'
+    assert np.allclose(actions[:, 0], 9.0), 'the caller-owned array must not be mutated in place'
+
+
+def test_gripper_only_latches_at_reset_not_at_the_first_observation(make_node):
+    """
+    The hold pose comes from /reset -- where the arm was placed -- not from the first chunk.
+
+    Latching off the first observation re-anchors to wherever the arm had drifted by the time
+    inference returned, so the very first command is a small correction: the arm twitches exactly
+    when the run starts. The reset pose is the one the arm is already being held at, so commanding
+    it moves nothing.
+    """
+    node = make_node(gripper_only=True)
+    start = np.array([0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0, 0.055])
+    drifted = np.array([0.9, 0.9, 0.9, 0.0, 0.0, 0.0, 1.0, 0.055])
+
+    with patch.object(node._client, 'reset', return_value=None):
+        node._reset_episode(start)
+    assert node._hold_pose is not None, '/reset must latch the hold pose'
+
+    obs = Observation(channels={'agent_pos': np.stack([drifted, drifted])}, n_obs_steps=2, n_action_steps=8)
+    actions = np.tile(np.array([9.0, 9.0, 9.0, 1.0, 0.0, 0.0, 0.0, 0.031]), (4, 1))
+    frozen = node._freeze_arm(actions, obs)
+
+    assert np.allclose(frozen[:, :3], start[:3]), 'must hold the reset pose, not the drifted one'
+    assert np.allclose(frozen[:, 7], 0.031), 'the gripper command must survive untouched'
+
+
+def test_gripper_only_does_not_latch_when_the_mode_is_off(make_node):
+    """A normal run must not pay for this at all -- no pose latched, poses passed through."""
+    node = make_node()
+    with patch.object(node._client, 'reset', return_value=None):
+        node._reset_episode(np.array([0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0, 0.055]))
+    assert node._hold_pose is None

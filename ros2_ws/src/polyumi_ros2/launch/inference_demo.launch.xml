@@ -54,6 +54,12 @@
   <!-- Tactile channels. false serves a visuomotor policy (dp); true adds finger_rgb and mic_0 for
        the Vista family. Must match the server's SERVE_TACTILE. -->
   <arg name="send_tactile" default="false"/>
+  <!-- TEMPORARY (branch gripper_only_hold): freeze the arm at its episode-start pose and let only
+       the gripper act, for evaluating a policy whose pose output is not trusted. -->
+  <arg name="gripper_only" default="false"/>
+  <!-- TEMPORARY (branch gripper_only_hold): omit camera0_rgb from the request, for a checkpoint
+       whose shape_meta declares only the tactile channels and the gripper width. -->
+  <arg name="send_camera0" default="true"/>
   <!-- Rows of mic_0 per request. MUST match the checkpoint's audio_obs_horizon: 17 for a
        checkpoint trained before the fork's shared-audio alignment, 10 after it. -->
   <arg name="n_audio_rows" default="17"/>
@@ -82,6 +88,8 @@
          the server's SERVE_TACTILE, and n_audio_rows must match the checkpoint's
          audio_obs_horizon — neither is detectable at runtime, so both are logged at startup. -->
     <param name="send_tactile" value="$(var send_tactile)"/>
+    <param name="gripper_only" value="$(var gripper_only)"/>
+    <param name="send_camera0" value="$(var send_camera0)"/>
     <param name="n_audio_rows" value="$(var n_audio_rows)"/>
   </node>
 </launch>

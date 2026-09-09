@@ -194,8 +194,8 @@
     # dataset -- a policy whose encoder shares one image_shape across its rgb keys needs
     # finger_rgb at camera0_rgb's 224x224, and a mismatch is a silently wrong input shape.
     finger_output_size:
-      width: -1
-      height: -1
+      width: 224
+      height: 224
     finger_crop:
       x_min: 170
       x_max: -1
