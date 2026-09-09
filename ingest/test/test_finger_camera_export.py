@@ -305,3 +305,39 @@ def test_selection_never_reaches_forward_in_time(tmp_path: pathlib.Path) -> None
     chosen = finger_ts[rows]
     steps = gopro_ts[: len(rows)] - FINGER_OFFSET_S
     assert np.all(chosen <= steps + 1e-9), 'no step may carry a frame captured after it'
+
+
+def test_finger_output_size_override_reaches_the_real_export_path():
+    """
+    The CLI override must reach the exporter, not only the --dry-run preview.
+
+    Those are two separate construction sites, and wiring only the preview produces a run that
+    reports the right plan and then writes a whole corpus at the wrong resolution -- discovered
+    hours later when the policy refuses the shape.
+    """
+    from unittest.mock import patch
+
+    from polyumi_ingest.export.dp.polyumi import export_scenes_to_polyumi
+
+    with patch('polyumi_ingest.export.dp.polyumi.export_scenes_to_dp') as inner:
+        export_scenes_to_polyumi([], pathlib.Path('unused.zarr.zip'), finger_output_size=(224, 224))
+
+    sizes = [m.output_size for m in inner.call_args.kwargs['modalities'] if hasattr(m, 'output_size')]
+    assert sizes == [(224, 224)]
+
+
+def test_finger_output_size_defaults_to_the_configured_value():
+    """Omitted, the export must use config/finger_camera.yaml, so normal runs are unchanged."""
+    from unittest.mock import patch
+
+    from polyumi_ingest.config import load_finger_camera_config
+    from polyumi_ingest.export.dp.polyumi import export_scenes_to_polyumi
+
+    configured = load_finger_camera_config()['output_size']
+    expected = None if configured is None else (int(configured[0]), int(configured[1]))
+
+    with patch('polyumi_ingest.export.dp.polyumi.export_scenes_to_dp') as inner:
+        export_scenes_to_polyumi([], pathlib.Path('unused.zarr.zip'))
+
+    sizes = [m.output_size for m in inner.call_args.kwargs['modalities'] if hasattr(m, 'output_size')]
+    assert sizes == [expected]

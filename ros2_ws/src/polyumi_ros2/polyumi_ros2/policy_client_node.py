@@ -261,6 +261,13 @@ class PolicyClientNode(Node):
         self.declare_parameter('finger_crop.x_max', -1)
         self.declare_parameter('finger_crop.y_min', 0)
         self.declare_parameter('finger_crop.y_max', -1)
+        # Resize applied AFTER the crop, mirroring the exporter's output_size. -1/-1 means none,
+        # which is the native crop and the shipped default. This must match the size the
+        # checkpoint's dataset was exported at: training and inference share crop_finger_rgb
+        # precisely so the frame the policy sees is byte-identical to the one it learned from, and
+        # a mismatch here reaches the model as a silently wrong input shape.
+        self.declare_parameter('finger_output_size.width', -1)
+        self.declare_parameter('finger_output_size.height', -1)
         # Largest age of the finger frame chosen for a step. The export's counterpart trims steps
         # past this rather than freezing an image, and 0.15 s is its shipped value (1.5 periods of
         # the 10 fps camera). Note the export picks the NEAREST frame, which may be up to half a
@@ -359,6 +366,9 @@ class PolicyClientNode(Node):
         for bound in ('x_min', 'x_max', 'y_min', 'y_max'):
             value = self.get_parameter(f'finger_crop.{bound}').get_parameter_value().integer_value
             self._finger_crop[bound] = None if value < 0 else value
+        out_w = self.get_parameter('finger_output_size.width').get_parameter_value().integer_value
+        out_h = self.get_parameter('finger_output_size.height').get_parameter_value().integer_value
+        self._finger_output_size = (out_w, out_h) if out_w > 0 and out_h > 0 else None
         self._latest_finger: np.ndarray | None = None
         self._latest_finger_stamp: rclpy.time.Time | None = None
         self._latest_finger_lock = threading.Lock()
@@ -687,7 +697,7 @@ class PolicyClientNode(Node):
         # policy's dataset does the square-crop-and-resize when it loads. Sending the crop keeps
         # this node reproducing what the EXPORTER stored, exactly as it does for camera0_rgb, and
         # leaves the encoder's input size where the fork decides it.
-        frame = crop_finger_rgb(decoded[:, :, ::-1], **self._finger_crop)
+        frame = crop_finger_rgb(decoded[:, :, ::-1], output_size=self._finger_output_size, **self._finger_crop)
         with self._latest_finger_lock:
             self._latest_finger = frame
             self._latest_finger_stamp = rclpy.time.Time.from_msg(msg.header.stamp)

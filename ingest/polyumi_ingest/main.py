@@ -4,6 +4,7 @@ ingest/main.py - PolyUMI ingest scripts to deal with pi's file & build pzarr sto
 See docs/data-format.md for an overview of the pzarr format.
 """
 
+import functools
 import inspect
 import json
 import logging
@@ -880,6 +881,24 @@ class ExportType(str, Enum):
     polyumi = 'polyumi'
 
 
+def _parse_finger_output_size(value: str | None) -> tuple[int, int] | None:
+    """
+    Parse a ``WxH`` finger-camera size, or None when unset.
+
+    Rejected rather than silently ignored on a malformed value: exporting a whole corpus at the
+    wrong resolution is only discovered when the policy refuses the shape hours later.
+    """
+    if value is None:
+        return None
+    parts = value.lower().split('x')
+    if len(parts) != 2 or not all(part.strip().isdigit() for part in parts):
+        raise typer.BadParameter(f'expected WxH (e.g. 224x224), got {value!r}')
+    width, height = (int(part) for part in parts)
+    if width < 1 or height < 1:
+        raise typer.BadParameter(f'dimensions must be positive, got {value!r}')
+    return (width, height)
+
+
 def _dry_run_export(
     scene_paths: list[pathlib.Path],
     modalities: list,
@@ -982,6 +1001,14 @@ def export_scenes(
         'needs preprocessing step 6) and the finger camera (data/finger_rgb, needs no step '
         'of its own). See docs/maniwav-audio-policy.md for the full contract.',
     ),
+    finger_output_size: str | None = typer.Option(
+        None,
+        '--finger-output-size',
+        help='Resize finger_rgb to WxH (e.g. 224x224) instead of the native crop, for --type '
+        'polyumi. Omit to use config/finger_camera.yaml. The finger camera dominates a polyumi '
+        'buffer -- at the native 648x982 it is ~13x the bytes of camera0_rgb -- and a policy whose '
+        'encoder shares one image_shape across its rgb keys needs this to match camera0_rgb.',
+    ),
     enforce_preprocessing: bool = typer.Option(
         True,
         '--enforce-preprocessing/--no-enforce-preprocessing',
@@ -1039,14 +1066,27 @@ def export_scenes(
     if dry_run:
         # Instantiated per run, exactly as export_scenes_to_polyumi does: a modality stashes
         # per-episode state on self, so this needs its own instances, not the classes.
-        modalities = [cls() for cls in POLYUMI_MODALITIES] if exporter_type == ExportType.polyumi else []
+        modalities = []
+        if exporter_type == ExportType.polyumi:
+            from polyumi_ingest.export.dp.finger_camera import FingerCameraModality
+
+            size = _parse_finger_output_size(finger_output_size)
+            modalities = [cls(output_size=size) if cls is FingerCameraModality else cls() for cls in POLYUMI_MODALITIES]
         _dry_run_export(scene_paths, modalities, enforce_preprocessing, min_segment_steps, as_json)
         return
 
     if output_path is None:
         log.error('--output/-o is required (omit it only with --dry-run).')
         raise typer.Exit(1)
-    export_fn = export_scenes_to_polyumi if exporter_type == ExportType.polyumi else export_scenes_to_dp
+    if exporter_type == ExportType.polyumi:
+        # Bound rather than added to _run_export's signature: only the polyumi exporter has a
+        # finger camera to size, and _run_export is shared with the visuomotor path.
+        export_fn = functools.partial(
+            export_scenes_to_polyumi,
+            finger_output_size=_parse_finger_output_size(finger_output_size),
+        )
+    else:
+        export_fn = export_scenes_to_dp
     _run_export(export_fn, scene_paths, output_path, enforce_preprocessing, min_segment_steps)
 
 

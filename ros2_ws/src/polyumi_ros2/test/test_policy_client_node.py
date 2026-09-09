@@ -14,6 +14,7 @@ import threading
 import time
 from unittest.mock import patch
 
+import cv2
 import numpy as np
 import pytest
 import rclpy
@@ -21,7 +22,7 @@ from geometry_msgs.msg import TransformStamped
 from rclpy.clock import ClockType
 from rclpy.parameter import Parameter
 from rclpy.time import Time
-from sensor_msgs.msg import Image, JointState
+from sensor_msgs.msg import CompressedImage, Image, JointState
 
 from polyumi_inference import ActionChunk, Observation, TransportError
 from polyumi_ros2.policy_client_node import PolicyClientNode
@@ -1228,3 +1229,35 @@ def test_finger_staleness_is_aged_against_now_like_the_wrist_frame(make_node):
 
     assert ages, 'the finger age must be published as a diagnostic'
     assert ages[0] == pytest.approx(0.5, abs=1e-3), 'aged against now, not against the instant it set'
+
+
+def test_finger_output_size_defaults_to_no_resize(make_node):
+    """The shipped default must leave the native crop alone, so existing checkpoints keep working."""
+    node = make_node(send_tactile=True)
+    assert node._finger_output_size is None
+
+
+def test_finger_output_size_is_applied_to_the_decoded_frame(make_node):
+    """
+    Set, it must resize exactly as the exporter's output_size does.
+
+    Training and inference share crop_finger_rgb so the frame the policy sees matches the one it
+    learned from; if this were declared but not passed through, a checkpoint trained on 224x224
+    would silently receive the native crop.
+    """
+    node = make_node(
+        send_tactile=True,
+        **{'finger_output_size.width': 224, 'finger_output_size.height': 224},
+    )
+    assert node._finger_output_size == (224, 224)
+
+    frame = np.zeros((648, 1152, 3), dtype=np.uint8)
+    ok, buf = cv2.imencode('.jpg', frame)
+    assert ok
+    msg = CompressedImage()
+    msg.format = 'jpeg'
+    msg.data = buf.tobytes()
+    msg.header.stamp = _t(100.0).to_msg()
+    node._finger_cb(msg)
+
+    assert node._latest_finger.shape[:2] == (224, 224)

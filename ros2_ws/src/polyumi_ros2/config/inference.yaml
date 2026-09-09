@@ -188,6 +188,14 @@
     #
     # The node crops and does NOT resize, matching what the exporter STORES; the square-crop and
     # resize to the encoder's input size is the policy dataset's job at load time.
+    # Resize applied after finger_crop, mirroring the exporter's output_size in
+    # ingest/config/finger_camera.yaml. -1 means no resize (the native crop, ~648x982).
+    # Set BOTH to whatever `pingest export --finger-output-size` used for the checkpoint's
+    # dataset -- a policy whose encoder shares one image_shape across its rgb keys needs
+    # finger_rgb at camera0_rgb's 224x224, and a mismatch is a silently wrong input shape.
+    finger_output_size:
+      width: -1
+      height: -1
     finger_crop:
       x_min: 170
       x_max: -1

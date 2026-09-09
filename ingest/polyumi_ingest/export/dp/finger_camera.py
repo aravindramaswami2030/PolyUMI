@@ -59,8 +59,16 @@ class FingerCameraModality(ExportModality):
     #: requires anyway for its start trim.
     required_steps = frozenset()
 
-    def __init__(self) -> None:
-        """Read the crop geometry once, so every episode in a buffer is cut the same way."""
+    def __init__(self, output_size: tuple[int, int] | None = None) -> None:
+        """
+        Read the crop geometry once, so every episode in a buffer is cut the same way.
+
+        ``output_size`` overrides ``config/finger_camera.yaml`` for this export only; ``None``
+        means use the configured value. The override exists because the resolution is a property
+        of the DATASET, not of the rig: one corpus may want native frames and another a 224x224
+        buffer that a policy's shared image_shape can accept, from the same recordings. The size
+        used is written into the buffer's meta attrs either way, so a dataset stays self-describing.
+        """
         cfg = load_finger_camera_config()
         crop = cfg['crop']
         self.crop = {
@@ -69,8 +77,8 @@ class FingerCameraModality(ExportModality):
             'y_min': int(crop['y_min']),
             'y_max': None if crop['y_max'] is None else int(crop['y_max']),
         }
-        output_size = cfg['output_size']
-        self.output_size = None if output_size is None else (int(output_size[0]), int(output_size[1]))
+        cfg_size = cfg['output_size'] if output_size is None else output_size
+        self.output_size = None if cfg_size is None else (int(cfg_size[0]), int(cfg_size[1]))
         self.max_staleness_s = float(cfg['max_staleness_s'])
 
         self._frames: zarr.Array | None = None
