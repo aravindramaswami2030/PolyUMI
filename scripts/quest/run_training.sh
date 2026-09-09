@@ -39,7 +39,8 @@ case "$POLICY" in
     vista)
         POLICY_DIR="$REPO_ROOT/external/polyumi_vista_policy"
         case "$VARIANT" in
-            polytouch|see_hear_feel|sparsh_x|vista|vista_vt|vista_va|vista_v) ;;
+            polytouch|see_hear_feel|sparsh_x|qformer|mitas|vta_diffusion|\
+            qformer_vt|qformer_va|qformer_v|vista|vista_vt|vista_va|vista_v) ;;
             *) echo "unknown Vista model: $VARIANT" >&2; exit 2 ;;
         esac
         ;;
@@ -88,9 +89,10 @@ else
     VISTA_MODEL="$VARIANT"
     VISTA_ABLATION=()
     case "$VARIANT" in
-        vista_vt) VISTA_MODEL=vista; VISTA_ABLATION+=(ablation=vt) ;;
-        vista_va) VISTA_MODEL=vista; VISTA_ABLATION+=(ablation=va) ;;
-        vista_v)  VISTA_MODEL=vista; VISTA_ABLATION+=(ablation=v) ;;
+        vista) VISTA_MODEL=qformer ;;
+        vista_vt|qformer_vt) VISTA_MODEL=qformer; VISTA_ABLATION+=(ablation=vt) ;;
+        vista_va|qformer_va) VISTA_MODEL=qformer; VISTA_ABLATION+=(ablation=va) ;;
+        vista_v|qformer_v)   VISTA_MODEL=qformer; VISTA_ABLATION+=(ablation=v) ;;
     esac
     bash scripts/train_day0suite.sh \
         --model "$VISTA_MODEL" \

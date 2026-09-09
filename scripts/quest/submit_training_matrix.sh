@@ -97,7 +97,8 @@ while IFS=$'\t' read -r NAME POLICY VARIANT EPOCHS BATCH REST; do
             ;;
         vista)
             case "$VARIANT" in
-                polytouch|see_hear_feel|sparsh_x|vista|vista_vt|vista_va|vista_v) ;;
+                polytouch|see_hear_feel|sparsh_x|qformer|mitas|vta_diffusion|\
+                qformer_vt|qformer_va|qformer_v|vista|vista_vt|vista_va|vista_v) ;;
                 *) echo "unknown Vista model for $NAME: $VARIANT" >&2; exit 2 ;;
             esac
             ;;

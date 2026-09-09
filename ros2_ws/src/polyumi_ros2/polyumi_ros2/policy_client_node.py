@@ -43,14 +43,22 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from sensor_msgs.msg import Image, JointState
+from foxglove_msgs.msg import RawAudio
+from sensor_msgs.msg import CompressedImage, Image, JointState
 from std_msgs.msg import Float32
 from tf2_ros import ConnectivityException, ExtrapolationException, LookupException  # type: ignore[attr-defined]
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
+from polyumi_ros2.audio_preproc import (
+    MIC0_SAMPLE_RATE_HZ,
+    MIC0_SAMPLES_PER_ROW,
+    decode_piezo,
+    mic0_rows,
+)
 from polyumi_ros2.camera_preproc import (
     CAMERA0_RGB_INTERPOLATION,
     MAX_BAR_INTENSITY,
+    crop_finger_rgb,
     crop_to_source_aspect,
     discarded_bar_intensity,
 )
@@ -89,6 +97,9 @@ DIAG_METRICS = (
     'inference_model_s',
     'inference_overhead_s',
     'image_age_s',
+    # The finger camera's counterpart to image_age_s. Its transport runs an order of magnitude
+    # behind the wrist camera's, so it is the stream most likely to be the one that stalled.
+    'finger_age_s',
     'gripper_state_age_s',
     'gripper_width_m',
 )
@@ -181,7 +192,8 @@ class PolicyClientNode(Node):
         # `ros2 run polyumi_ros2 latency_probe` (one mode per value) — procedures in
         # docs/calibration-instructions.md, "Latencies". gopro and proprio are consumed by
         # _lookup_agent_pos, arm_exec and gripper_exec by _n_stale_actions; finger_cam and
-        # piezo_mic are declared but unused until the policy takes tactile input.
+        # piezo_mic shift the instant the tactile channels are sampled at, and so are consumed
+        # only when send_tactile is on.
         self.declare_parameter('latency.gopro', 0.0)
         self.declare_parameter('latency.finger_cam', 0.0)
         self.declare_parameter('latency.piezo_mic', 0.0)
@@ -226,6 +238,46 @@ class PolicyClientNode(Node):
         # How far back (seconds) the EE-pose TF buffer retains history — must be >= the
         # largest latency being compensated for (see _lookup_agent_pos).
         self.declare_parameter('buffers.ee_pose_s', 1.0)
+
+        # --- Tactile channels (finger camera + contact mic) ---
+        #
+        # Off by default, so a visuomotor policy (POLICY=dp) is served exactly as before: it
+        # requires neither channel, and sending them would only cost bandwidth. Turn on for the
+        # Vista family, every member of which indexes obs['finger_rgb'] and obs['mic_0']
+        # unconditionally — see the fork's docs/SENSOR_PROCESSING.md.
+        self.declare_parameter('send_tactile', False)
+        self.declare_parameter('finger_image_topic', '/pi/camera/image/compressed')
+        self.declare_parameter('audio_topic', '/pi/audio/raw')
+        # Rows of `mic_0` per request — the policy's `audio_obs_horizon`. THIS MUST MATCH THE
+        # CHECKPOINT: 10 on the Vista fork's current contract (~0.33 s), but 17 for a checkpoint
+        # trained before that alignment. A mismatch is not an error anywhere; the policy simply
+        # receives a window it was never trained on, so the value is logged at startup.
+        self.declare_parameter('n_audio_rows', 10)
+        # The `finger_rgb` crop, which IS the contract — a policy trained on one crop cannot be
+        # served frames from another. Defaults mirror ingest/config/finger_camera.yaml, where the
+        # provenance of x_min=170 (the mount's occlusion, measured) is written down. Negative
+        # means "the frame's own edge", standing in for that file's `null`.
+        self.declare_parameter('finger_crop.x_min', 170)
+        self.declare_parameter('finger_crop.x_max', -1)
+        self.declare_parameter('finger_crop.y_min', 0)
+        self.declare_parameter('finger_crop.y_max', -1)
+        # Resize applied AFTER the crop, mirroring the exporter's output_size. -1/-1 means none,
+        # which is the native crop and the shipped default. This must match the size the
+        # checkpoint's dataset was exported at: training and inference share crop_finger_rgb
+        # precisely so the frame the policy sees is byte-identical to the one it learned from, and
+        # a mismatch here reaches the model as a silently wrong input shape.
+        self.declare_parameter('finger_output_size.width', -1)
+        self.declare_parameter('finger_output_size.height', -1)
+        # Largest age of the finger frame chosen for a step. The export's counterpart trims steps
+        # past this rather than freezing an image, and 0.15 s is its shipped value (1.5 periods of
+        # the 10 fps camera). Note the export picks the NEAREST frame, which may be up to half a
+        # period in the future; inference can only ever look backwards, so the same bound admits
+        # a slightly older frame here than it did there. Unfixable — the future does not exist at
+        # inference — and recorded so a rollout's staleness is judged against the right baseline.
+        self.declare_parameter('max_finger_age_s', 0.15)
+        # Seconds of piezo audio retained. Must exceed n_audio_rows * 33.5 ms plus the largest
+        # latency compensated for, or the window would run off the start of the buffer.
+        self.declare_parameter('buffers.piezo_s', 2.0)
 
         self._url = self.get_parameter('inference_server_url').get_parameter_value().string_value
         self._n_obs_steps = self.get_parameter('n_obs_steps').get_parameter_value().integer_value
@@ -279,8 +331,14 @@ class PolicyClientNode(Node):
             action_dt=self._action_dt,
         )
 
-        # History buffers — each entry: (image_uint8 [H,W,C], agent_pos [8])
+        # History buffers — each entry: (image_uint8 [H,W,C], agent_pos [8], finger|None).
+        # The finger slot is None whenever send_tactile is off, so a visuomotor run carries
+        # the same tuple shape rather than two buffer layouts to keep straight.
         self._obs_buffer: deque = deque(maxlen=self._n_obs_steps)
+        # (stamp, resized frame) history for the wrist camera, for the same reason as
+        # _finger_history. The frames are already resized to 224x224 here, so a couple of seconds
+        # at 60 Hz costs a few MB, not the hundreds a raw-frame history would.
+        self._image_history: deque = deque(maxlen=max(8, int(self._ee_pose_buffer_s * 70)))
         # Receding-horizon stride counter: inference runs on the tick where this is 0, then
         # every steps_per_inference ticks after. Kept in [0, steps_per_inference) so it never
         # grows. Starts at 0 so the first full-buffer tick infers immediately.
@@ -298,6 +356,36 @@ class PolicyClientNode(Node):
         # ee_pose_s at the observed ~17 Hz with headroom, floored so a tiny buffer config can't
         # leave us with a single sample and no interval to interpolate over.
         self._gripper_buffer: deque = deque(maxlen=max(8, int(self._ee_pose_buffer_s * 40)))
+
+        # --- Tactile state (only populated when send_tactile is on) ---
+        self._send_tactile = self.get_parameter('send_tactile').get_parameter_value().bool_value
+        self._n_audio_rows = self.get_parameter('n_audio_rows').get_parameter_value().integer_value
+        self._max_finger_age_s = self.get_parameter('max_finger_age_s').get_parameter_value().double_value
+        # -1 stands in for finger_camera.yaml's `null`, i.e. the frame's own edge.
+        self._finger_crop = {}
+        for bound in ('x_min', 'x_max', 'y_min', 'y_max'):
+            value = self.get_parameter(f'finger_crop.{bound}').get_parameter_value().integer_value
+            self._finger_crop[bound] = None if value < 0 else value
+        out_w = self.get_parameter('finger_output_size.width').get_parameter_value().integer_value
+        out_h = self.get_parameter('finger_output_size.height').get_parameter_value().integer_value
+        self._finger_output_size = (out_w, out_h) if out_w > 0 and out_h > 0 else None
+        self._latest_finger: np.ndarray | None = None
+        self._latest_finger_stamp: rclpy.time.Time | None = None
+        self._latest_finger_lock = threading.Lock()
+        # (stamp, frame) history, newest last. Only the newest frame is needed while the wrist
+        # camera sets the observation instant; once the slowest stream sets it instead, the frame
+        # wanted is the one captured THEN, which is several frames back. Sized from the buffer
+        # window rather than a frame count so it holds the same span at any capture rate.
+        self._finger_history: deque = deque(maxlen=max(4, int(self._ee_pose_buffer_s * 30)))
+        # Piezo audio as one flat ring: a deque of blocks would need re-concatenating on every
+        # tick, and the window is a plain slice of a contiguous buffer. `_piezo_end_ns` is the
+        # capture time one sample PAST the last one held, which is what turns an observation
+        # instant into an index (see _mic0_channel).
+        piezo_seconds = self.get_parameter('buffers.piezo_s').get_parameter_value().double_value
+        self._piezo_capacity = max(int(piezo_seconds * MIC0_SAMPLE_RATE_HZ), self._n_audio_rows * MIC0_SAMPLES_PER_ROW)
+        self._piezo = np.zeros(0, dtype=np.float32)
+        self._piezo_end_ns: int | None = None
+        self._piezo_lock = threading.Lock()
         self._gripper_lock = threading.Lock()
         # Reject a cached frame older than this at tick time; a frame older than this means the
         # capture pipeline stalled. The auto default (max_image_age_s <= 0) is two camera periods
@@ -382,6 +470,24 @@ class PolicyClientNode(Node):
             10,
             callback_group=MutuallyExclusiveCallbackGroup(),
         )
+        if self._send_tactile:
+            # Both on their own callback groups for the reason the gripper has one: audio arrives
+            # in a steady stream that must not be serialised behind a control tick, or the ring
+            # develops holes the window silently zero-fills.
+            self.create_subscription(
+                CompressedImage,
+                self.get_parameter('finger_image_topic').get_parameter_value().string_value,
+                self._finger_cb,
+                1,
+                callback_group=MutuallyExclusiveCallbackGroup(),
+            )
+            self.create_subscription(
+                RawAudio,
+                self.get_parameter('audio_topic').get_parameter_value().string_value,
+                self._audio_cb,
+                50,
+                callback_group=MutuallyExclusiveCallbackGroup(),
+            )
 
         # Inference runs on its own thread, never in the timer callback: a round trip is several
         # control periods long, and issuing it inline would hold the exclusive callback group for
@@ -434,6 +540,18 @@ class PolicyClientNode(Node):
             f'latency config — {latency_str} (ee_pose buffer: {self._ee_pose_buffer_s}s, '
             f'max_image_age: {self._max_image_age_s * 1e3:.0f}ms, tf lookup: {tf_mode})'
         )
+        if self._send_tactile:
+            # n_audio_rows is stated loudly because nothing downstream can catch it being wrong:
+            # a window of the wrong length is a valid frame the policy was simply never trained
+            # on. 10 is the Vista fork's current contract; a checkpoint from before that
+            # alignment wants 17.
+            self.get_logger().info(
+                f'tactile channels ON — finger_rgb crop {self._finger_crop} '
+                f'(max age {self._max_finger_age_s * 1e3:.0f}ms), '
+                f'mic_0 {self._n_audio_rows} rows x {MIC0_SAMPLES_PER_ROW} samples '
+                f'({self._n_audio_rows * MIC0_SAMPLES_PER_ROW / MIC0_SAMPLE_RATE_HZ * 1e3:.0f}ms) '
+                f"— MUST match the checkpoint's audio_obs_horizon"
+            )
         self.get_logger().info(
             f'latency budget — measured observation age (capture→response) + '
             f'act={self._latency_act}s arm / {self._latency_act_gripper}s gripper '
@@ -560,12 +678,124 @@ class PolicyClientNode(Node):
         # is bit-identical to doing it here. See _control_tick's payload note.
         with self._latest_image_lock:
             self._latest_image = resized
+            self._image_history.append((rclpy.time.Time.from_msg(msg.header.stamp), resized))
             # Keep the frame's own stamp: the pose lookup must align to when THIS frame was
             # captured, not to when the control tick happens to run. The camera publishes at
             # 60 Hz while the tick runs at control_hz, so a cached frame is already up to one
             # camera period old before the tick even fires — and if the v4l2 pipeline stalls,
             # unboundedly older, with no way to notice. See _lookup_agent_pos.
             self._latest_image_stamp = rclpy.time.Time.from_msg(msg.header.stamp)
+
+    def _finger_cb(self, msg: CompressedImage) -> None:
+        """Decode a finger-camera frame, apply the export's crop, and cache it with its stamp."""
+        buf = np.frombuffer(msg.data, dtype=np.uint8)
+        decoded = cv2.imdecode(buf, cv2.IMREAD_COLOR)  # BGR, as OpenCV always decodes
+        if decoded is None:
+            self._warn_throttled(f'Could not decode finger frame (format={msg.format!r})')
+            return
+        # Crop, do not resize: the exporter stores `finger_rgb` at the crop's native size and the
+        # policy's dataset does the square-crop-and-resize when it loads. Sending the crop keeps
+        # this node reproducing what the EXPORTER stored, exactly as it does for camera0_rgb, and
+        # leaves the encoder's input size where the fork decides it.
+        frame = crop_finger_rgb(decoded[:, :, ::-1], output_size=self._finger_output_size, **self._finger_crop)
+        with self._latest_finger_lock:
+            self._latest_finger = frame
+            self._latest_finger_stamp = rclpy.time.Time.from_msg(msg.header.stamp)
+            self._finger_history.append((self._latest_finger_stamp, frame))
+
+    def _audio_cb(self, msg: RawAudio) -> None:
+        """Append one piezo block to the ring, tracking the capture time of its far end."""
+        if msg.sample_rate != MIC0_SAMPLE_RATE_HZ:
+            self._warn_throttled(
+                f'Contact-mic audio is {msg.sample_rate} Hz but mic_0 is defined at '
+                f'{MIC0_SAMPLE_RATE_HZ} Hz; dropping. The block width, and so the policy input, '
+                f'is meaningless at another rate.'
+            )
+            return
+        try:
+            block = decode_piezo(bytes(msg.data), msg.number_of_channels)
+        except ValueError as exc:
+            self._warn_throttled(f'Contact-mic audio rejected: {exc}')
+            return
+
+        start_ns = rclpy.time.Time.from_msg(msg.timestamp).nanoseconds
+        with self._piezo_lock:
+            if self._piezo_end_ns is not None:
+                # Bridge or trim to what the stamp says, rather than assuming the stream is
+                # gapless: the Pi's own bridge warns about dropped chunks, and silently butting
+                # blocks together would slide the whole history against the wall clock, which no
+                # shape check can see. A gap becomes silence of the right duration.
+                gap = int(round((start_ns - self._piezo_end_ns) * MIC0_SAMPLE_RATE_HZ / 1e9))
+                if gap > 0:
+                    self._warn_throttled(f'Contact-mic gap of {gap} sample(s); filling with silence.')
+                    self._piezo = np.concatenate((self._piezo, np.zeros(gap, dtype=np.float32)))
+                elif gap < 0:
+                    block = block[-gap:] if -gap < block.size else block[:0]
+            self._piezo = np.concatenate((self._piezo, block))
+            if self._piezo.size > self._piezo_capacity:
+                self._piezo = self._piezo[-self._piezo_capacity :]
+            self._piezo_end_ns = start_ns + int(round(block.size * 1e9 / MIC0_SAMPLE_RATE_HZ))
+
+    @staticmethod
+    def _frame_at(history: deque, capture_instant: rclpy.time.Time, latency_s: float):
+        """
+        Newest (stamp, frame) in ``history`` captured at or before ``capture_instant``.
+
+        ``history`` holds publish stamps; a frame's capture instant is ``stamp - latency_s``.
+        Backwards-only, and returns None when the whole history is newer than the instant asked
+        for -- that means the stream had not yet produced the frame, and holding the next-newest
+        would pair the policy with the future.
+        """
+        cutoff = capture_instant + Duration(seconds=latency_s)
+        best = None
+        for stamp, frame in history:
+            if stamp <= cutoff:
+                best = (stamp, frame)
+            else:
+                break
+        return best
+
+    def _observation_instant(self) -> rclpy.time.Time | None:
+        """
+        Return the newest instant every enabled stream covers: the oldest of their newest samples.
+
+        An observation is only as fresh as its slowest stream, so the minimum is what makes every
+        channel describe the same moment -- at the cost of that moment being slightly older. The
+        margin is not academic: the finger camera's transport runs ~150 ms behind the GoPro's
+        (measured over the USB gadget link), which is more than one finger-camera frame period.
+        """
+        with self._latest_image_lock:
+            image_stamp = self._latest_image_stamp
+        if image_stamp is None:
+            return None
+        instants = [image_stamp - Duration(seconds=self._latency['gopro'])]
+        if self._send_tactile:
+            with self._latest_finger_lock:
+                finger_stamp = self._latest_finger_stamp
+            if finger_stamp is None:
+                return None
+            instants.append(finger_stamp - Duration(seconds=self._latency['finger_cam']))
+            with self._piezo_lock:
+                piezo_end_ns = self._piezo_end_ns
+            if piezo_end_ns is None:
+                return None
+            piezo_end = rclpy.time.Time(nanoseconds=piezo_end_ns)
+            instants.append(piezo_end - Duration(seconds=self._latency['piezo_mic']))
+        return min(instants, key=lambda t: t.nanoseconds)
+
+    def _mic0_channel(self, stamp: rclpy.time.Time) -> np.ndarray | None:
+        """Cut the ``mic_0`` window ending at ``stamp``, or ``None`` if no audio has arrived."""
+        with self._piezo_lock:
+            if self._piezo_end_ns is None or self._piezo.size == 0:
+                return None
+            piezo, end_ns = self._piezo, self._piezo_end_ns
+        # How far the observation instant sits before the newest sample held.
+        behind = int(round((end_ns - stamp.nanoseconds) * MIC0_SAMPLE_RATE_HZ / 1e9))
+        end_index = piezo.size - max(behind, 0)
+        if end_index <= 0:
+            self._warn_throttled('Contact-mic buffer holds nothing at the observation instant')
+            return None
+        return mic0_rows(piezo, end_index, self._n_audio_rows)
 
     def _gripper_cb(self, msg: JointState) -> None:
         """Cache the gripper aperture with its stamp, whichever driver published it."""
@@ -657,13 +887,17 @@ class PolicyClientNode(Node):
         Never blocks on the network: the request itself is issued by _inference_worker, so a slow
         round trip costs a superseded observation rather than the control ticks that ran during it.
         """
-        # --- 1. Get latest image ---
-        with self._latest_image_lock:
-            image = self._latest_image
-            image_stamp = self._latest_image_stamp
-        if image is None or image_stamp is None:
-            self._warn_throttled('Waiting for first camera image')
+        # --- 1. Pick the instant every stream can cover, then sample them all at it ---
+        t_obs = self._observation_instant()
+        if t_obs is None:
+            self._warn_throttled('Waiting for first frame on every enabled stream')
             return
+        with self._latest_image_lock:
+            picked = self._frame_at(self._image_history, t_obs, self._latency['gopro'])
+        if picked is None:
+            self._warn_throttled('No wrist frame at the observation instant')
+            return
+        image_stamp, image = picked
 
         # Guard against pairing a stale frame with a fresh pose (see _max_image_age_s).
         image_age_s = (self.get_clock().now() - image_stamp).nanoseconds * 1e-9
@@ -677,13 +911,33 @@ class PolicyClientNode(Node):
             )
             return
 
-        # --- 2. Get EEF pose from TF, aligned to this frame's capture instant ---
+        # --- 2. Get EEF pose from TF, aligned to that same instant ---
         agent_pos = self._lookup_agent_pos(image_stamp)
         if agent_pos is None:
             return  # warning already logged inside
 
         # --- 3. Append to history buffer ---
-        self._obs_buffer.append((image, agent_pos))
+        # The finger frame is sampled at the shared observation instant, not the tick's: the two
+        # cameras share the observation timeline the sampler built at training ("same instants as
+        # wrist"). None when tactile is off, or when no frame is fresh enough — checked below,
+        # once the window is full, so a startup gap reads as "filling" rather than as a fault.
+        finger = None
+        if self._send_tactile:
+            with self._latest_finger_lock:
+                found = self._frame_at(self._finger_history, t_obs, self._latency['finger_cam'])
+            if found is not None:
+                finger_stamp, candidate = found
+                # Aged against now, exactly as the wrist frame is, because this guard exists to
+                # catch a stalled stream. Measuring against t_obs instead would compare the finger
+                # camera to an instant it usually sets itself -- it is the slowest stream, so that
+                # gap is near zero however long the camera has been dead.
+                age = (self.get_clock().now() - finger_stamp).nanoseconds / 1e9
+                self._diag('finger_age_s', age)
+                if age > self._max_finger_age_s:
+                    self._warn_throttled(f'Finger frame {age:.3f}s stale (limit {self._max_finger_age_s}s)')
+                else:
+                    finger = candidate
+        self._obs_buffer.append((image, agent_pos, finger))
         if len(self._obs_buffer) < self._n_obs_steps:
             self._warn_throttled(f'Observation buffer filling ({len(self._obs_buffer)}/{self._n_obs_steps})')
             return
@@ -709,16 +963,30 @@ class PolicyClientNode(Node):
         #
         # Images stay uint8 all the way from _image_cb: that is the dtype the dataset stores, and
         # the server's /255 reproduces the old float32 payload exactly at a quarter of the bytes.
+        channels = {
+            'camera0_rgb': np.stack([entry[0] for entry in self._obs_buffer]),
+            'agent_pos': np.stack([entry[1] for entry in self._obs_buffer]),
+        }
+        if self._send_tactile:
+            # Both tactile channels are all-or-nothing for a request: the Vista family indexes
+            # them unconditionally, and the wire format deliberately refuses a partial frame
+            # rather than letting a modality reach the model as absent. Skipping the tick is the
+            # honest failure — the next one may have the data.
+            fingers = [entry[2] for entry in self._obs_buffer]
+            mic = self._mic0_channel(t_obs + Duration(seconds=self._latency['piezo_mic']))
+            if any(frame is None for frame in fingers) or mic is None:
+                self._warn_throttled('Skipping inference: tactile channels incomplete this tick')
+                return
+            channels['finger_rgb'] = np.stack(fingers)
+            channels['mic_0'] = mic
+
         obs = Observation(
-            channels={
-                'camera0_rgb': np.stack([entry[0] for entry in self._obs_buffer]),
-                'agent_pos': np.stack([entry[1] for entry in self._obs_buffer]),
-            },
+            channels=channels,
             n_obs_steps=self._n_obs_steps,
             n_action_steps=self._n_action_steps,
         )
-        # t_obs: when this frame was actually captured, i.e. the instant action[0] targets.
-        self._submit_inference(obs, image_stamp - Duration(seconds=self._latency['gopro']))
+        # t_obs: the instant every channel above describes, i.e. what action[0] targets.
+        self._submit_inference(obs, t_obs)
 
     def _lookup_agent_pos(self, image_stamp: rclpy.time.Time) -> np.ndarray | None:
         """
