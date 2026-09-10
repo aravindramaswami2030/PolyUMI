@@ -12,6 +12,7 @@ Options:
   --partition NAME   Slurm partition (default: gengpu)
   --gpu RESOURCE     Slurm GRES request (default: gpu:1; any GPU model)
   --time HH:MM:SS    Per-task time limit (default: 02:00:00)
+  --checkpoint-every N  Periodic recovery-checkpoint interval (default: 5)
   --cpus N           CPUs per task (default: 8)
   --mem SIZE         Memory per task (default: 64G)
   --wandb-mode MODE  offline, online, or disabled (default: offline)
@@ -28,6 +29,7 @@ ACCOUNT=p52914
 PARTITION=gengpu
 GPU_RESOURCE=gpu:1
 TIME_LIMIT=02:00:00
+CHECKPOINT_EVERY=5
 CPUS=8
 MEMORY=64G
 WANDB_MODE=offline
@@ -44,6 +46,7 @@ while [[ $# -gt 0 ]]; do
         --partition) PARTITION="$2"; shift 2 ;;
         --gpu) GPU_RESOURCE="$2"; shift 2 ;;
         --time) TIME_LIMIT="$2"; shift 2 ;;
+        --checkpoint-every) CHECKPOINT_EVERY="$2"; shift 2 ;;
         --cpus) CPUS="$2"; shift 2 ;;
         --mem) MEMORY="$2"; shift 2 ;;
         --wandb-mode) WANDB_MODE="$2"; shift 2 ;;
@@ -58,6 +61,7 @@ done
 [[ -n "$DATASETS_FILE" && -n "$MODELS_FILE" ]] || { usage >&2; exit 2; }
 [[ "$MAX_PARALLEL" =~ ^[1-9][0-9]*$ ]] || { echo "max-parallel must be positive" >&2; exit 2; }
 [[ "$CPUS" =~ ^[1-9][0-9]*$ ]] || { echo "cpus must be positive" >&2; exit 2; }
+[[ "$CHECKPOINT_EVERY" =~ ^[1-9][0-9]*$ ]] || { echo "checkpoint-every must be positive" >&2; exit 2; }
 case "$WANDB_MODE" in offline|online|disabled) ;; *) echo "invalid W&B mode" >&2; exit 2 ;; esac
 
 DATASETS_FILE="$(realpath -e "$DATASETS_FILE")"
@@ -139,6 +143,7 @@ export POLYUMI_REPO_ROOT="$REPO_ROOT"
 export WANDB_MODE
 export WANDB_ENTITY
 export WANDB_PROJECT
+export CHECKPOINT_EVERY
 JOB_ID="$(sbatch --parsable \
     --account="$ACCOUNT" --partition="$PARTITION" --gres="$GPU_RESOURCE" \
     --nodes=1 --ntasks=1 --cpus-per-task="$CPUS" --mem="$MEMORY" --time="$TIME_LIMIT" \

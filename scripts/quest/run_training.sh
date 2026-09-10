@@ -16,6 +16,7 @@ EPOCHS="$4"
 BATCH_SIZE="$5"
 DATASET_NAME="$6"
 MODEL_NAME="$7"
+CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-5}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -25,6 +26,7 @@ TRAIN_ROOT="${POLYUMI_TRAIN_ROOT:-$(dirname "$REPO_ROOT")}"
 [[ -f "$DATASET" ]] || { echo "dataset not found: $DATASET" >&2; exit 2; }
 [[ "$EPOCHS" =~ ^[1-9][0-9]*$ ]] || { echo "epochs must be a positive integer" >&2; exit 2; }
 [[ "$BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || { echo "batch size must be a positive integer" >&2; exit 2; }
+[[ "$CHECKPOINT_EVERY" =~ ^[1-9][0-9]*$ ]] || { echo "checkpoint interval must be a positive integer" >&2; exit 2; }
 [[ "$DATASET_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "invalid dataset name: $DATASET_NAME" >&2; exit 2; }
 [[ "$MODEL_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "invalid model name: $MODEL_NAME" >&2; exit 2; }
 
@@ -69,8 +71,8 @@ WANDB_MODE="${WANDB_MODE:-offline}"
 cd "$POLICY_DIR"
 "$PYTHON" -c 'import torch; assert torch.cuda.is_available(); print("GPU:", torch.cuda.get_device_name(0))'
 
-printf 'policy=%s\ndataset=%s\nvariant=%s\nepochs=%s\nbatch_size=%s\njob_id=%s\nstarted_at=%s\n' \
-    "$POLICY" "$DATASET" "$VARIANT" "$EPOCHS" "$BATCH_SIZE" "$RUN_ID" "$STARTED_AT" \
+printf 'policy=%s\ndataset=%s\nvariant=%s\nepochs=%s\nbatch_size=%s\ncheckpoint_every=%s\njob_id=%s\nstarted_at=%s\n' \
+    "$POLICY" "$DATASET" "$VARIANT" "$EPOCHS" "$BATCH_SIZE" "$CHECKPOINT_EVERY" "$RUN_ID" "$STARTED_AT" \
     > "$OUTPUT_DIR/run-metadata.txt"
 
 if [[ "$POLICY" == dp ]]; then
@@ -79,7 +81,7 @@ if [[ "$POLICY" == dp ]]; then
         "task.dataset_path=$DATASET" \
         "hydra.run.dir=$OUTPUT_DIR" \
         "training.num_epochs=$EPOCHS" \
-        training.checkpoint_every=5 \
+        "training.checkpoint_every=$CHECKPOINT_EVERY" \
         "dataloader.batch_size=$BATCH_SIZE" \
         "val_dataloader.batch_size=$BATCH_SIZE" \
         "dataloader.num_workers=${DATALOADER_WORKERS:-4}" \
@@ -103,7 +105,7 @@ else
         "${VISTA_ABLATION[@]}" \
         "hydra.run.dir=$OUTPUT_DIR" \
         "training.num_epochs=$EPOCHS" \
-        training.checkpoint_every=5 \
+        "training.checkpoint_every=$CHECKPOINT_EVERY" \
         "dataloader.batch_size=$BATCH_SIZE" \
         "val_dataloader.batch_size=$BATCH_SIZE" \
         "dataloader.num_workers=${DATALOADER_WORKERS:-4}" \

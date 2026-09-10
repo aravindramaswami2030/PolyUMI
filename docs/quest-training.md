@@ -141,8 +141,12 @@ scripts/quest/submit_training_matrix.sh \
   --datasets datasets.tsv \
   --models models.tsv \
   --max-parallel 2 \
+  --checkpoint-every 5 \
   --time 24:00:00
 ```
+
+`--checkpoint-every` controls numbered recovery checkpoints and `latest.ckpt`. The single
+best-validation checkpoint is still evaluated independently after every epoch.
 
 DP models run on both dataset types. Vista models are automatically paired only with `polyumi`
 datasets. Each array element trains one pair, so one failure does not stop the other experiments.
@@ -179,7 +183,7 @@ dataset/policy/model combination.
 
 VisTA-family training evaluates the best-checkpoint candidate after every validation epoch and
 retains one lowest-loss checkpoint. Numbered recovery checkpoints and `latest.ckpt` remain on the
-`training.checkpoint_every` schedule (five epochs in the Quest launcher). This preserves an exact
+`training.checkpoint_every` schedule (configurable with `--checkpoint-every`, default five). This preserves an exact
 validation minimum without returning to an every-epoch recovery-checkpoint schedule.
 
 Preview the expected two Sparsh-X, two Vista, and two DP-TIMM checkpoints:
