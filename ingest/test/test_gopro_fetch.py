@@ -8,7 +8,7 @@ import unittest.mock as mock
 
 import pytest
 from polyumi_ingest import gopro_fetch
-from polyumi_ingest.gopro_fetch import GOPRO_VIDEO_SUBDIR, find_gopro_video
+from polyumi_ingest.gopro_fetch import GOPRO_DCIM_SUBDIR, find_gopro_video, gopro_video_dirs
 
 _EPOCH = datetime.datetime(2026, 8, 17, 12, 0, 0, tzinfo=datetime.timezone.utc)
 
@@ -21,11 +21,20 @@ def _clear_cache():
     gopro_fetch._START_TIME_CACHE.clear()
 
 
-def _card(tmp_path: pathlib.Path, n_clips: int) -> pathlib.Path:
-    """Build a mount point holding ``n_clips`` MP4s, one per minute from _EPOCH."""
-    video_dir = tmp_path / 'card' / GOPRO_VIDEO_SUBDIR
-    video_dir.mkdir(parents=True)
-    for i in range(n_clips):
+def _card(
+    tmp_path: pathlib.Path,
+    n_clips: int,
+    folder: str = '100GOPRO',
+    first: int = 0,
+) -> pathlib.Path:
+    """
+    Build a mount point holding ``n_clips`` MP4s, one per minute from _EPOCH.
+
+    Call twice with different ``folder``/``first`` to lay out a card that has rolled over.
+    """
+    video_dir = tmp_path / 'card' / GOPRO_DCIM_SUBDIR / folder
+    video_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(first, first + n_clips):
         (video_dir / f'GX01{i:04d}.MP4').write_bytes(b'not really an mp4')
     return tmp_path / 'card'
 
@@ -68,7 +77,7 @@ def test_a_rewritten_clip_is_reprobed(tmp_path: pathlib.Path) -> None:
     GoPro filenames restart per card, so path alone would collide across cards.
     """
     card = _card(tmp_path, 1)
-    clip = card / GOPRO_VIDEO_SUBDIR / 'GX010000.MP4'
+    clip = card / GOPRO_DCIM_SUBDIR / '100GOPRO' / 'GX010000.MP4'
 
     with mock.patch.object(gopro_fetch, '_probe_start_time', side_effect=_fake_probe) as probe:
         find_gopro_video(_EPOCH, mount_point=card)
@@ -101,3 +110,29 @@ def test_an_explicit_mount_point_skips_card_detection(tmp_path: pathlib.Path) ->
         find_gopro_video(_EPOCH, mount_point=card)
 
     detect.assert_not_called()
+
+
+def test_clips_are_found_after_a_dcim_folder_rollover(tmp_path: pathlib.Path) -> None:
+    """
+    A GoPro rolls over to 101GOPRO after 999 files, and can do it mid-scene.
+
+    Searching only 100GOPRO silently loses every clip recorded after the boundary, so the
+    match must reach across folders.
+    """
+    _card(tmp_path, 3, folder='100GOPRO', first=0)
+    card = _card(tmp_path, 3, folder='101GOPRO', first=3)
+
+    with mock.patch.object(gopro_fetch, '_probe_start_time', side_effect=_fake_probe):
+        match = find_gopro_video(_EPOCH + datetime.timedelta(minutes=4), mount_point=card)
+
+    assert match.name == 'GX010004.MP4'
+    assert match.parent.name == '101GOPRO'
+
+
+def test_gopro_video_dirs_lists_every_folder_in_order(tmp_path: pathlib.Path) -> None:
+    """Folders come back oldest-numbered first; a volume with no DCIM yields nothing."""
+    _card(tmp_path, 1, folder='101GOPRO', first=3)
+    card = _card(tmp_path, 1, folder='100GOPRO', first=0)
+
+    assert [d.name for d in gopro_video_dirs(card)] == ['100GOPRO', '101GOPRO']
+    assert gopro_video_dirs(tmp_path / 'not-a-card') == []
