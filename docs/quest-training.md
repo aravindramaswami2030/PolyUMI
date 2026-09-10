@@ -105,19 +105,22 @@ become output-directory components, so use letters, numbers, dots, underscores, 
 
 ```text
 name            policy  variant                                          epochs  batch_size
-dp_timm         dp      train_diffusion_unet_timm_polyumi_workspace      120     32
-polytouch       vista   polytouch                                        120     4
-see_hear_feel   vista   see_hear_feel                                    120     8
+vta_diffusion   vista   vta_diffusion                                    120     8
+qformer         vista   qformer                                          120     8
+qformer_vt      vista   qformer_vt                                       120     8
+qformer_va      vista   qformer_va                                       120     8
+qformer_v       vista   qformer_v                                        120     8
+mitas           vista   mitas                                            120     8
+mitas_vt        vista   mitas_vt                                         120     8
+mitas_va        vista   mitas_va                                         120     8
+mitas_v         vista   mitas_v                                          120     8
 sparsh_x        vista   sparsh_x                                         120     8
-vista           vista   vista                                            120     8
-vista_vt        vista   vista_vt                                         120     8
-vista_va        vista   vista_va                                         120     8
-vista_v         vista   vista_v                                          120     8
+see_hear_feel   vista   see_hear_feel                                    120     8
 ```
 
 Vista variants are `polytouch`, `see_hear_feel`, `sparsh_x`, `qformer`, `mitas`, and
-`vta_diffusion`, plus the Q-Former ablations `qformer_vt` (vision+tactile), `qformer_va`
-(vision+audio), and `qformer_v` (vision only). The legacy manifest names `vista`, `vista_vt`,
+`vta_diffusion`, plus the Q-Former and MItas ablations: the `_vt`, `_va`, and `_v` suffixes
+select vision+tactile, vision+audio, and vision-only, respectively. The legacy manifest names `vista`, `vista_vt`,
 `vista_va`, and `vista_v` remain supported aliases for their `qformer` equivalents so existing
 Quest manifests continue to work. The base variants correspond to model-specific YAML files under
 `external/polyumi_vista_policy/vista/config/`; the ablations compose the matching Hydra overlay
