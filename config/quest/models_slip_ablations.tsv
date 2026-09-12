@@ -1,0 +1,4 @@
+name	policy	variant	epochs	batch_size
+slip_v	dp	train_diffusion_unet_timm_polyumi_slip_v_workspace	120	32
+slip_va	dp	train_diffusion_unet_timm_polyumi_slip_va_workspace	120	32
+slip_vt	dp	train_diffusion_unet_timm_polyumi_slip_vt_workspace	120	32
