@@ -199,10 +199,10 @@ client warns every second naming the topic it expected. The full contract is the
 of `external/franka_streaming_impedance_controller/franka_streaming_impedance_client/franka_streaming_impedance_client/target_chunk.py`;
 which topic *this* deployment uses is `ros2_ws/src/polyumi_ros2/polyumi_ros2/target_chunk.py`.
 
-`fr3_home_service` runs alongside it, serving only `/polyumi/home` — joint-space homing
-through move_group. It and the streaming controller claim the same `<joint>/effort` interfaces, so
-**exactly one holds the arm at a time** — `ros2 control list_controllers` tells you which, and
-`/polyumi/home` swaps them itself around a home move:
+`fr3_home_service` runs alongside it, serving `/polyumi/home` (joint-space homing through
+move_group) and `/polyumi/set_home` (teach that pose). It and the streaming controller claim the
+same `<joint>/effort` interfaces, so **exactly one holds the arm at a time** — `ros2 control
+list_controllers` tells you which, and `/polyumi/home` swaps them itself around a home move:
 
 ```bash
 # Arm must be STATIONARY: switching restarts the libfranka control loop.
@@ -212,6 +212,41 @@ ros2 control switch_controllers --deactivate fr3_arm_controller \
 
 (This is the manual form of the swap `/polyumi/home` does itself, both directions, hands back
 afterwards.)
+
+### A repeatable start pose for evals
+
+Rollouts are only comparable if every trial starts from the same place, and that place is
+task-specific rather than the SRDF `ready` pose. Teach it once, then home before each trial:
+
+```bash
+# 1. Put the arm where trials should start (Desk guiding mode, or any other means).
+# 2. Record it. Does NOT move the arm — it only reads /joint_states.
+ros2 service call /polyumi/set_home std_srvs/srv/Trigger "{}"
+
+# 3. Before every trial. MOVES THE ARM.
+ros2 service call /polyumi/home std_srvs/srv/Trigger "{}"
+```
+
+Both are callable from the laptop despite the rmw gap, as long as the type is spelled out — the
+ROS *graph* does not cross Humble↔Kilted, so `ros2 node list` comes back empty, but service calls
+match on DDS endpoints.
+
+What is worth knowing about it:
+
+- **Joint positions, not a TCP pose.** Replaying Cartesian coordinates would leave the elbow free
+  to come back in a different configuration, which is the trial-to-trial variation this exists to
+  remove.
+- **It persists**, to `~/.ros/polyumi_home_pose.yaml` (`home_pose_file` param; `''` turns
+  persistence off), so it survives the next bringup. The file wins over the `home_joints`
+  parameter — it is the more recent and more specific statement of where the task starts. Delete
+  it to fall back to the SRDF pose.
+- **Which pose is loaded is logged at startup and named in every response**, because a pose
+  taught weeks ago is otherwise indistinguishable from the default until the arm moves.
+- **A stale or absent `/joint_states` is refused rather than recorded.** If the broadcaster dies
+  the last message stays cached, and nothing on the wire distinguishes it from a stationary arm.
+- `set_home` is refused while a home is in flight, since the arm is then somewhere it is merely
+  passing through. It does not know whether a *policy* is driving the arm — only teach between
+  rollouts.
 
 ## The facts you can't deduce by looking
 
