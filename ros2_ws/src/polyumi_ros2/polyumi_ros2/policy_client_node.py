@@ -65,6 +65,8 @@ from polyumi_ros2.camera_preproc import (
 from polyumi_inference import Observation, TransportError, WireFormatError
 from polyumi_inference.client import PolicyClient
 
+from std_srvs.srv import Trigger
+
 from polyumi_ros2.gripper_map import aperture_from_joint_state, policy_to_robot_width, robot_to_policy_width
 from polyumi_ros2.target_chunk import CONSUMER_HINT, TargetChunkPublisher, pose_array
 from polyumi_ros2.temporal_ensemble import TemporalEnsembler
@@ -234,6 +236,10 @@ class PolicyClientNode(Node):
         # gripper_offset_m: it was always exactly -gripper_min_width_m, and two knobs for one
         # measurement could be set inconsistently. See gripper_map.
         self.declare_parameter('gripper_max_width_m', 0.0812)
+        # Aperture the /polyumi/release_gripper service commands, in metres. Defaults to the full
+        # stroke: the PolyUMI fingers open to 0.0812 m and the driver clamps above that, so asking
+        # for more is silently the same as asking for max.
+        self.declare_parameter('gripper_release_width_m', 0.0812)
         self.declare_parameter('gripper_min_width_m', 0.0)
         # How far back (seconds) the EE-pose TF buffer retains history — must be >= the
         # largest latency being compensated for (see _lookup_agent_pos).
@@ -376,6 +382,13 @@ class PolicyClientNode(Node):
 
         # --- Tactile state (only populated when send_tactile is on) ---
         self._gripper_only = self.get_parameter('gripper_only').get_parameter_value().bool_value
+        self._gripper_release_width_m = self.get_parameter(
+            'gripper_release_width_m').get_parameter_value().double_value
+        # Manual override latch. While set, the gripper column of every commanded chunk is replaced
+        # with the release width, so the policy keeps running and the arm keeps its behaviour but
+        # the hand stays open. A one-shot publish would be overwritten by the next chunk ~300 ms
+        # later, which is why this is a latch rather than a single command.
+        self._gripper_released = False
         self._send_camera0 = self.get_parameter('send_camera0').get_parameter_value().bool_value
         self._send_tactile = self.get_parameter('send_tactile').get_parameter_value().bool_value
         self._n_audio_rows = self.get_parameter('n_audio_rows').get_parameter_value().integer_value
@@ -441,6 +454,13 @@ class PolicyClientNode(Node):
                 joint_name=self._eef_frame,
             )
             self._gripper_pub = self.create_publisher(JointTrajectory, '/polyumi/target_gripper', 10)
+            # Manual release/hold. Trigger services rather than a topic so the caller gets an
+            # acknowledgement with the width actually latched, and so `ros2 service call` is the
+            # whole user interface -- no extra node to run at the bench.
+            self._release_srv = self.create_service(
+                Trigger, '/polyumi/release_gripper', self._on_release_gripper)
+            self._hold_srv = self.create_service(
+                Trigger, '/polyumi/hold_gripper', self._on_hold_gripper)
 
         # Viz-only preview publisher (always on when publish_preview). Shows every commanded chunk
         # in Foxglove/RViz without moving the arm: the streaming controller subscribes only to the
@@ -1154,6 +1174,39 @@ class PolicyClientNode(Node):
             )
         return robot_to_policy_width(width, self._gripper_min_width_m)
 
+    def _on_release_gripper(self, request, response):
+        """Latch the gripper open. Stays open until /polyumi/hold_gripper."""
+        del request
+        self._gripper_released = True
+        w = self._gripper_release_width_m
+        self.get_logger().warning(f'gripper RELEASED by service -- holding open at {w:.4f} m')
+        response.success = True
+        response.message = f'gripper released, holding at {w:.4f} m'
+        return response
+
+    def _on_hold_gripper(self, request, response):
+        """Hand the gripper back to the policy."""
+        del request
+        was = self._gripper_released
+        self._gripper_released = False
+        self.get_logger().warning('gripper released-latch CLEARED -- policy is commanding again')
+        response.success = True
+        response.message = 'policy back in control' if was else 'was not released'
+        return response
+
+    def _override_gripper(self, actions: np.ndarray) -> np.ndarray:
+        """
+        Replace the gripper column with the release width, in POLICY units.
+
+        Column 7 is policy-space width, which is aperture minus the closed offset -- the same
+        space the model emits -- so the conversion has to happen here rather than at publish time,
+        where the value is converted again.
+        """
+        released = np.array(actions, copy=True)
+        released[:, 7] = robot_to_policy_width(
+            self._gripper_release_width_m, self._gripper_min_width_m)
+        return released
+
     def _freeze_arm(self, actions: np.ndarray, obs: Observation) -> np.ndarray:
         """
         Replace every action's pose with a LATCHED hold pose, leaving the gripper untouched.
@@ -1350,6 +1403,8 @@ class PolicyClientNode(Node):
         actions = self._ensembler.blend(t_obs.nanoseconds * 1e-9, chunk.actions)
         if self._gripper_only:
             actions = self._freeze_arm(actions, obs)
+        if self._gripper_released:
+            actions = self._override_gripper(actions)
         latency_model_s = None if chunk.model_ms is None else chunk.model_ms * 1e-3
 
         # Viz-only preview: publish the full commanded chunk (before the stale-drop below) so the
