@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Copy the best validation checkpoint from completed Quest runs to local storage."""
+"""Copy selected validation and latest checkpoints from Quest to local storage."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 
 root = os.path.realpath(sys.argv[1])
 required_epochs = int(sys.argv[2])
+include_incomplete = bool(int(sys.argv[3]))
 epoch_re = re.compile(r"^epoch=(\d+)(?:-|\.ckpt$)")
 
 for current, dirs, files in os.walk(root):
@@ -37,7 +38,8 @@ for current, dirs, files in os.walk(root):
                 metadata[key] = value
     if metadata.get("epochs") != str(required_epochs):
         continue
-    if not os.path.isfile(os.path.join(current, "SUCCESS")):
+    completed = os.path.isfile(os.path.join(current, "SUCCESS"))
+    if not completed and not include_incomplete:
         continue
 
     rel = os.path.relpath(current, root).split(os.sep)
@@ -50,10 +52,14 @@ for current, dirs, files in os.walk(root):
         continue
 
     checkpoints = {}
+    recovery_epochs = []
     for name in os.listdir(checkpoint_dir):
         match = epoch_re.match(name)
         if match and name.endswith(".ckpt"):
-            checkpoints.setdefault(int(match.group(1)), []).append(name)
+            epoch = int(match.group(1))
+            checkpoints.setdefault(epoch, []).append(name)
+            if "val_loss=" not in name:
+                recovery_epochs.append(epoch)
 
     validation = {}
     with open(log_path, encoding="utf-8") as handle:
@@ -77,6 +83,10 @@ for current, dirs, files in os.walk(root):
         name,
     ))
     checkpoint = os.path.join(checkpoint_dir, names[0])
+    latest_checkpoint = os.path.join(checkpoint_dir, "latest.ckpt")
+    if not os.path.isfile(latest_checkpoint):
+        latest_checkpoint = None
+    latest_epoch = max(recovery_epochs) if recovery_epochs else None
     mtime = os.path.getmtime(meta_path)
     started_at = metadata.get("started_at")
     if not started_at:
@@ -97,6 +107,10 @@ for current, dirs, files in os.walk(root):
         "val_loss": loss,
         "checkpoint": checkpoint,
         "size": os.path.getsize(checkpoint),
+        "latest_checkpoint": latest_checkpoint,
+        "latest_size": os.path.getsize(latest_checkpoint) if latest_checkpoint else None,
+        "latest_epoch": latest_epoch,
+        "completed": completed,
         "mtime": mtime,
     }, sort_keys=True))
 '''
@@ -125,6 +139,18 @@ def parse_args() -> argparse.Namespace:
         help="Only export this model name; repeat for multiple models",
     )
     parser.add_argument(
+        "--dataset", action="append", default=[],
+        help="Only export this dataset name; repeat for multiple datasets",
+    )
+    parser.add_argument(
+        "--include-latest", action="store_true",
+        help="Also export the latest periodic recovery checkpoint",
+    )
+    parser.add_argument(
+        "--include-incomplete", action="store_true",
+        help="Include active or interrupted runs that do not have a SUCCESS marker",
+    )
+    parser.add_argument(
         "--expect", default=0, type=int,
         help="Fail unless this many dataset/model checkpoints are found",
     )
@@ -140,6 +166,7 @@ def scan_remote(args: argparse.Namespace) -> list[dict]:
     remote_command = " ".join([
         "python3", "-c", shlex.quote(REMOTE_SCAN),
         shlex.quote(args.remote_root), shlex.quote(str(args.epochs)),
+        shlex.quote("1" if args.include_incomplete else "0"),
     ])
     command = [
         "ssh", "-o", "BatchMode=yes", args.host, remote_command,
@@ -153,6 +180,9 @@ def scan_remote(args: argparse.Namespace) -> list[dict]:
     if args.model:
         wanted = set(args.model)
         runs = [run for run in runs if run["model"] in wanted]
+    if args.dataset:
+        wanted = set(args.dataset)
+        runs = [run for run in runs if run["dataset"] in wanted]
     if not args.all_runs:
         newest = {}
         for run in runs:
@@ -171,6 +201,28 @@ def scan_remote(args: argparse.Namespace) -> list[dict]:
     return runs
 
 
+def copy_remote_file(
+    args: argparse.Namespace, source: str, target: Path, expected_size: int
+) -> None:
+    if target.exists() and target.stat().st_size == expected_size:
+        print(f"Already present: {target}")
+        return
+
+    partial = target.with_name(target.name + ".partial")
+    remote_source = f"{args.host}:{source}"
+    if shutil.which("rsync"):
+        command = [
+            "rsync", "--partial", "--info=progress2", "-e",
+            "ssh -o BatchMode=yes", remote_source, str(partial),
+        ]
+    else:
+        command = ["scp", "-o", "BatchMode=yes", remote_source, str(partial)]
+    subprocess.run(command, check=True)
+    if partial.stat().st_size != expected_size:
+        raise RuntimeError(f"Size verification failed for {partial}")
+    os.replace(partial, target)
+
+
 def copy_checkpoint(args: argparse.Namespace, run: dict) -> Path:
     model_dir = args.destination / run["dataset"] / run["policy"] / run["model"]
     output_dir = model_dir / f"{run['run_date']}_run-{run['run_id']}"
@@ -187,25 +239,18 @@ def copy_checkpoint(args: argparse.Namespace, run: dict) -> Path:
         legacy_dir.rename(output_dir)
         print(f"Added run date: {legacy_dir} -> {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
-    if target.exists() and target.stat().st_size == run["size"]:
-        print(f"Already present: {target}")
-    else:
-        partial = target.with_name(target.name + ".partial")
-        source = f"{args.host}:{run['checkpoint']}"
-        if shutil.which("rsync"):
-            command = [
-                "rsync", "--partial", "--info=progress2", "-e",
-                "ssh -o BatchMode=yes", source, str(partial),
-            ]
-        else:
-            command = ["scp", "-o", "BatchMode=yes", source, str(partial)]
-        subprocess.run(command, check=True)
-        if partial.stat().st_size != run["size"]:
-            raise RuntimeError(f"Size verification failed for {partial}")
-        os.replace(partial, target)
+    copy_remote_file(args, run["checkpoint"], target, run["size"])
 
     selection = dict(run)
     selection["local_checkpoint"] = str(target)
+    if args.include_latest and run.get("latest_checkpoint"):
+        latest_epoch = run.get("latest_epoch")
+        epoch_text = "unknown" if latest_epoch is None else f"{latest_epoch:04d}"
+        latest_target = output_dir / f"latest-epoch={epoch_text}.ckpt"
+        copy_remote_file(
+            args, run["latest_checkpoint"], latest_target, run["latest_size"]
+        )
+        selection["local_latest_checkpoint"] = str(latest_target)
     metadata_path = output_dir / "selection.json"
     metadata_path.write_text(json.dumps(selection, indent=2) + "\n", encoding="utf-8")
     return target
