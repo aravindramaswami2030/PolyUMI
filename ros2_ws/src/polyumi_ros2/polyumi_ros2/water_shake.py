@@ -114,9 +114,7 @@ def level_rotation(approach_world: np.ndarray) -> Rotation:
     return Rotation.from_matrix(np.column_stack([x_axis, y_axis, z_axis]))
 
 
-def shake_heights(
-    amplitude_m: float, n_shakes: int, period_s: float, dt: float, symmetric: bool = False
-) -> np.ndarray:
+def shake_heights(amplitude_m: float, n_shakes: int, period_s: float, dt: float, symmetric: bool = False) -> np.ndarray:
     """
     Displacements along the shake axis, one per waypoint, for `n_shakes` cycles.
 
@@ -171,11 +169,49 @@ class WaterShakeNode(Node):
         self.declare_parameter('waypoint_dt', 0.05)
         self.declare_parameter('level_time_s', 2.0)
         self.declare_parameter('settle_s', 0.5)
-        # Squeeze: command the jaws this much NARROWER than where they rest on the bottle, so the
-        # driver's Move stalls against it and that stall becomes grip force. A bottle held at
+        # Squeeze: command the jaws this much NARROWER than where they rest on the object, so the
+        # driver's Move stalls against it and that stall becomes grip force. An object held at
         # exactly its measured width slips the moment the shake accelerates it. 2 mm is small on
         # purpose -- the payload is 0.7 kg and the aim is to stop slip, not crush a plastic bottle.
+        #
+        # This measure-then-squeeze path is CALIBRATION, to be run once per object. It is not safe
+        # to repeat every trial: the jaws stay closed between trials, so the second trial measures
+        # the width the first one squeezed to and takes another 2 mm off it. Across a session that
+        # ratchets (76.9 mm to 73.7 mm over eight trials, observed), which is a monotonic change in
+        # the setup that lands confounded with the class label whenever classes are collected in
+        # blocks -- it made the finger camera encode trial number rather than the object.
         self.declare_parameter('grip_squeeze_m', 0.002)
+        # The width to hold, in metres, once calibration has produced one. Set this for every trial
+        # after the first so each grip is identical; 0 means "calibrate instead", i.e. measure what
+        # the jaws rest at and take grip_squeeze_m off it. Either way the width actually commanded
+        # is logged as GRIP_TARGET_M=<metres> so a collection script can capture it and hand it
+        # back on the trials that follow.
+        self.declare_parameter('grip_width_m', 0.0)
+        # Where the shake starts from, in the base frame, and how far each trial is allowed to
+        # wander from it. An unset home_xyz (all zeros) means "use wherever the arm is now", and that
+        # used is logged as HOME_XYZ=x,y,z so a collection script can capture it once and hand it
+        # back on every later trial.
+        #
+        # That hand-back is not optional. Jittering around the CURRENT pose instead of a recorded
+        # one makes each trial start from the last trial's jittered position, so the start point
+        # random-walks across the session -- a drift indistinguishable from the class label when
+        # classes are collected in blocks, which is the failure this jitter exists to prevent.
+        #
+        # The point of the jitter: with a fixed start pose every trial photographs the same scene,
+        # so a per-session offset in the camera's level or colour balance is the only thing that
+        # varies and a classifier reads it instead of the object. Moving the start makes the view
+        # vary far more than any such offset. Note this MASKS that nuisance rather than removing
+        # it -- the offset belongs to the session, not the pose -- so it complements interleaving
+        # the classes, it does not replace it.
+        # All-zeros means "not set". It has to be a real triple of doubles rather than an empty
+        # list, because rclpy infers a parameter's type from its default and an empty list infers
+        # BYTE_ARRAY, which then rejects the coordinates this is meant to carry -- a failure that
+        # appears only on the robot, the first time someone passes a real position. Zeros are an
+        # unambiguous sentinel here: the base frame's origin is inside the robot, so the TCP can
+        # never legitimately be there.
+        self.declare_parameter('home_xyz', [0.0, 0.0, 0.0])
+        self.declare_parameter('jitter_xyz_m', [0.0, 0.0, 0.0])
+        self.declare_parameter('jitter_seed', -1)
         self.declare_parameter('grip', True)
         self.declare_parameter('grip_time_s', 1.0)
         # Direction to shake along, in the BASE frame. [0,0,1] is the original vertical shake.
@@ -209,6 +245,10 @@ class WaterShakeNode(Node):
                 'base_frame',
                 'eef_frame',
                 'grip_squeeze_m',
+                'grip_width_m',
+                'home_xyz',
+                'jitter_xyz_m',
+                'jitter_seed',
                 'grip',
                 'grip_time_s',
                 'shake_axis',
@@ -242,30 +282,8 @@ class WaterShakeNode(Node):
             with self._grip_lock:
                 self._grip_width = float(width)
 
-    def squeeze(self, timeout_s: float = 10.0) -> float | None:
-        """
-        Command the jaws `grip_squeeze_m` tighter than they currently rest; return the target.
-
-        Measured at start-up rather than configured, because the right width depends on which
-        bottle is in the gripper today. Returns None if no gripper state arrived -- not fatal, so
-        the caller warns and carries on rather than aborting a trial mid-collection.
-        """
-        deadline = time.monotonic() + timeout_s
-        width = None
-        while time.monotonic() < deadline:
-            with self._grip_lock:
-                width = self._grip_width
-            if width is not None:
-                break
-            time.sleep(0.1)
-        if width is None:
-            self.get_logger().warn(
-                f'no {GRIPPER_STATE_TOPIC} within {timeout_s:.0f}s -- not squeezing. The bottle '
-                'may slip once the shake accelerates it.'
-            )
-            return None
-
-        target = max(0.0, width - float(self._p['grip_squeeze_m']))
+    def _command_width(self, target: float) -> float:
+        """Publish one absolute jaw width and report it in a form a script can capture."""
         msg = JointTrajectory()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.joint_names = [GRIPPER_JOINT_NAME]
@@ -276,11 +294,48 @@ class WaterShakeNode(Node):
         point.time_from_start = Duration(sec=int(self._p['grip_time_s']), nanosec=0)
         msg.points.append(point)
         self._grip_pub.publish(msg)
-        self.get_logger().info(
-            f'gripper: resting at {width * 1000:.1f}mm, commanding {target * 1000:.1f}mm '
-            f'({float(self._p["grip_squeeze_m"]) * 1000:.1f}mm squeeze)'
-        )
+        self.get_logger().info(f'GRIP_TARGET_M={target:.6f}')
         return target
+
+    def squeeze(self, timeout_s: float = 10.0) -> float | None:
+        """
+        Hold `grip_width_m` if one is configured, otherwise calibrate one and return it.
+
+        Calibration measures where the jaws rest on the object and takes `grip_squeeze_m` off
+        that, because the right width depends on which object is in the gripper today. Run it
+        once per object and pass the width it reports back as `grip_width_m` for every trial
+        after, so every trial grips identically instead of tightening on the last one.
+
+        Returns None only if calibration was needed and no gripper state arrived -- not fatal, so
+        the caller warns and carries on rather than aborting a trial mid-collection.
+        """
+        fixed = float(self._p['grip_width_m'])
+        if fixed > 0.0:
+            self.get_logger().info(f'gripper: holding the configured {fixed * 1000:.1f}mm (no re-measure)')
+            return self._command_width(fixed)
+
+        deadline = time.monotonic() + timeout_s
+        width = None
+        while time.monotonic() < deadline:
+            with self._grip_lock:
+                width = self._grip_width
+            if width is not None:
+                break
+            time.sleep(0.1)
+        if width is None:
+            self.get_logger().warn(
+                f'no {GRIPPER_STATE_TOPIC} within {timeout_s:.0f}s -- not squeezing. The object '
+                'may slip once the shake accelerates it.'
+            )
+            return None
+
+        target = max(0.0, width - float(self._p['grip_squeeze_m']))
+        self.get_logger().info(
+            f'gripper: calibrating -- resting at {width * 1000:.1f}mm, commanding '
+            f'{target * 1000:.1f}mm ({float(self._p["grip_squeeze_m"]) * 1000:.1f}mm squeeze). '
+            f'Pass grip_width_m:={target:.6f} on every trial after this one.'
+        )
+        return self._command_width(target)
 
     def lookup_tcp(self, timeout_s: float = 30.0) -> tuple[np.ndarray, np.ndarray]:
         """
@@ -302,8 +357,7 @@ class WaterShakeNode(Node):
                 t, r = tf.transform.translation, tf.transform.rotation
                 return np.array([t.x, t.y, t.z]), np.array([r.x, r.y, r.z, r.w])
             if not warned and time.monotonic() > deadline - timeout_s + 3.0:
-                self.get_logger().info(
-                    f'waiting for TF {base} -> {eef} (DDS discovery can take a few seconds)...')
+                self.get_logger().info(f'waiting for TF {base} -> {eef} (DDS discovery can take a few seconds)...')
                 warned = True
             time.sleep(0.1)
 
@@ -313,21 +367,67 @@ class WaterShakeNode(Node):
             f'Frames the buffer did see:\n{known}\n'
             'If that list is empty, nothing is publishing /tf to this host -- check that the '
             'NUC bringup is up. If it lists fr3_* frames, the chain is incomplete rather than '
-            'absent.')
+            'absent.'
+        )
+
+    def start_position(self, measured: np.ndarray) -> np.ndarray:
+        """
+        Pick this trial's start point: the reference position plus a fresh random offset.
+
+        The reference is `home_xyz` when one was supplied and the measured TCP otherwise, and it
+        is logged either way so the first trial of a collection can publish the number the rest
+        reuse. Offsets are uniform and independent per axis, bounded by `jitter_xyz_m`.
+        """
+        home = [float(v) for v in self._p['home_xyz']]
+        if len(home) == 3 and any(home):
+            reference = np.array(home)
+        else:
+            if len(home) not in (0, 3):
+                self.get_logger().warn(f'home_xyz needs 3 values, got {len(home)} -- ignoring it.')
+            reference = np.asarray(measured, dtype=float)
+        self.get_logger().info(f'HOME_XYZ={reference[0]:.6f},{reference[1]:.6f},{reference[2]:.6f}')
+
+        bound = np.abs(np.array([float(v) for v in self._p['jitter_xyz_m']], dtype=float))
+        if bound.shape != (3,):
+            self.get_logger().warn(f'jitter_xyz_m needs 3 values, got {bound.size} -- not jittering.')
+            return reference
+        seed = int(self._p['jitter_seed'])
+        rng = np.random.default_rng(None if seed < 0 else seed)
+        offset = rng.uniform(-bound, bound)
+        if bound.any():
+            self.get_logger().info(
+                f'start offset {1000 * offset[0]:+.0f},{1000 * offset[1]:+.0f},'
+                f'{1000 * offset[2]:+.0f} mm from the reference '
+                f'(bounds +/-{1000 * bound[0]:.0f},{1000 * bound[1]:.0f},{1000 * bound[2]:.0f} mm)'
+            )
+        return reference + offset
 
     def build_poses(self, position: np.ndarray, quat: np.ndarray) -> list[Pose]:
         """
-        Build the full commanded path: level in place, settle, then shake.
+        Build the full commanded path: move to this trial's start while levelling, settle, shake.
 
-        Position is held at `position` for the levelling and the settle; only the shake moves it,
-        and only in world Z.
+        The levelling phase does double duty as the approach: the tool rotates level and the TCP
+        travels from where it is to the jittered start over the same `level_time_s`, so adding the
+        jitter costs no extra time. Once there the position is held for the settle, and only the
+        shake moves it, along `shake_axis`.
         """
         dt = self._p['waypoint_dt']
         level_quat = level_rotation(Rotation.from_quat(quat).as_matrix()[:, 2]).as_quat()
+        start = self.start_position(position)
 
         n_level = max(2, int(round(self._p['level_time_s'] / dt)))
-        poses = [_pose(position, q) for q in slerp_quats(quat, level_quat, n_level)]
-        poses += [_pose(position, level_quat)] * max(0, int(round(self._p['settle_s'] / dt)))
+        travel = float(np.linalg.norm(start - np.asarray(position, dtype=float)))
+        if travel > 0 and travel / max(self._p['level_time_s'], 1e-6) > MAX_SPEED_MPS:
+            self.get_logger().warn(
+                f'approaching the start needs {travel * 100:.1f}cm in {self._p["level_time_s"]:.1f}s '
+                f'-- above the controller max of {MAX_SPEED_MPS} m/s, so it will clamp. Lengthen '
+                'level_time_s or shrink jitter_xyz_m.'
+            )
+        ramp = np.linspace(0.0, 1.0, n_level)[:, None]
+        path = np.asarray(position, dtype=float) + ramp * (start - np.asarray(position, dtype=float))
+        poses = [_pose(p, q) for p, q in zip(path, slerp_quats(quat, level_quat, n_level))]
+        poses += [_pose(start, level_quat)] * max(0, int(round(self._p['settle_s'] / dt)))
+        position = start
 
         for d in shake_heights(
             self._p['amplitude_m'],
@@ -439,7 +539,7 @@ def main():
     spin_thread.start()
     try:
         node.run_once()
-        time.sleep(0.5)          # let the published chunk actually go out before shutdown
+        time.sleep(0.5)  # let the published chunk actually go out before shutdown
     except Exception as exc:  # noqa: BLE001 - a CLI tool should print, not traceback
         node.get_logger().error(str(exc))
         return 1
