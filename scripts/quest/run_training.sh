@@ -17,6 +17,7 @@ BATCH_SIZE="$5"
 DATASET_NAME="$6"
 MODEL_NAME="$7"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-5}"
+TRAINING_RESUME="${TRAINING_RESUME:-false}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -27,6 +28,10 @@ TRAIN_ROOT="${POLYUMI_TRAIN_ROOT:-$(dirname "$REPO_ROOT")}"
 [[ "$EPOCHS" =~ ^[1-9][0-9]*$ ]] || { echo "epochs must be a positive integer" >&2; exit 2; }
 [[ "$BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || { echo "batch size must be a positive integer" >&2; exit 2; }
 [[ "$CHECKPOINT_EVERY" =~ ^[1-9][0-9]*$ ]] || { echo "checkpoint interval must be a positive integer" >&2; exit 2; }
+[[ "$TRAINING_RESUME" == true || "$TRAINING_RESUME" == false ]] || {
+    echo "TRAINING_RESUME must be true or false" >&2
+    exit 2
+}
 [[ "$DATASET_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "invalid dataset name: $DATASET_NAME" >&2; exit 2; }
 [[ "$MODEL_NAME" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "invalid model name: $MODEL_NAME" >&2; exit 2; }
 
@@ -55,9 +60,17 @@ PYTHON="$TRAIN_ROOT/envs/$POLICY/bin/python"
 
 RUN_ID="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-manual}}_${SLURM_ARRAY_TASK_ID:-0}"
 STARTED_AT="$(date --iso-8601=seconds)"
+if [[ "$TRAINING_RESUME" == true && -z "${OUTPUT_DIR:-}" ]]; then
+    echo "OUTPUT_DIR must name the existing run when TRAINING_RESUME=true" >&2
+    exit 2
+fi
 OUTPUT_DIR="${OUTPUT_DIR:-$TRAIN_ROOT/outputs/$DATASET_NAME/$MODEL_NAME/$RUN_ID}"
 mkdir -p "$OUTPUT_DIR" "$TRAIN_ROOT/cache/huggingface" "$TRAIN_ROOT/cache/torch" \
     "$TRAIN_ROOT/cache/numba" "$TRAIN_ROOT/cache/matplotlib"
+if [[ "$TRAINING_RESUME" == true && ! -f "$OUTPUT_DIR/checkpoints/latest.ckpt" ]]; then
+    echo "resume checkpoint not found: $OUTPUT_DIR/checkpoints/latest.ckpt" >&2
+    exit 2
+fi
 
 export PATH="$TRAIN_ROOT/envs/$POLICY/bin:$PATH"
 export HF_HOME="$TRAIN_ROOT/cache/huggingface"
@@ -71,9 +84,16 @@ WANDB_MODE="${WANDB_MODE:-offline}"
 cd "$POLICY_DIR"
 "$PYTHON" -c 'import torch; assert torch.cuda.is_available(); print("GPU:", torch.cuda.get_device_name(0))'
 
-printf 'policy=%s\ndataset=%s\nvariant=%s\nepochs=%s\nbatch_size=%s\ncheckpoint_every=%s\njob_id=%s\nstarted_at=%s\n' \
-    "$POLICY" "$DATASET" "$VARIANT" "$EPOCHS" "$BATCH_SIZE" "$CHECKPOINT_EVERY" "$RUN_ID" "$STARTED_AT" \
-    > "$OUTPUT_DIR/run-metadata.txt"
+METADATA_PATH="$OUTPUT_DIR/run-metadata.txt"
+if [[ "$TRAINING_RESUME" == true ]]; then
+    METADATA_PATH="$OUTPUT_DIR/run-metadata-resume-$RUN_ID.txt"
+    if [[ -f "$OUTPUT_DIR/SUCCESS" ]]; then
+        mv "$OUTPUT_DIR/SUCCESS" "$OUTPUT_DIR/SUCCESS.before-resume-$RUN_ID"
+    fi
+fi
+printf 'policy=%s\ndataset=%s\nvariant=%s\nepochs=%s\nbatch_size=%s\ncheckpoint_every=%s\nresume=%s\njob_id=%s\nstarted_at=%s\n' \
+    "$POLICY" "$DATASET" "$VARIANT" "$EPOCHS" "$BATCH_SIZE" "$CHECKPOINT_EVERY" "$TRAINING_RESUME" "$RUN_ID" "$STARTED_AT" \
+    > "$METADATA_PATH"
 
 if [[ "$POLICY" == dp ]]; then
     "$PYTHON" train.py \
@@ -82,6 +102,7 @@ if [[ "$POLICY" == dp ]]; then
         "hydra.run.dir=$OUTPUT_DIR" \
         "training.num_epochs=$EPOCHS" \
         "training.checkpoint_every=$CHECKPOINT_EVERY" \
+        "training.resume=$TRAINING_RESUME" \
         "dataloader.batch_size=$BATCH_SIZE" \
         "val_dataloader.batch_size=$BATCH_SIZE" \
         "dataloader.num_workers=${DATALOADER_WORKERS:-4}" \
@@ -106,6 +127,7 @@ else
         "hydra.run.dir=$OUTPUT_DIR" \
         "training.num_epochs=$EPOCHS" \
         "training.checkpoint_every=$CHECKPOINT_EVERY" \
+        "training.resume=$TRAINING_RESUME" \
         "dataloader.batch_size=$BATCH_SIZE" \
         "val_dataloader.batch_size=$BATCH_SIZE" \
         "dataloader.num_workers=${DATALOADER_WORKERS:-4}" \
