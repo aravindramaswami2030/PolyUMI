@@ -16,6 +16,8 @@ import subprocess
 
 log = logging.getLogger(__name__)
 
+#: Conventional first video folder a GoPro creates. Used by tests to build a fixture card;
+#: production code must never hardcode this alone -- see ``_gopro_video_dirs`` for why.
 GOPRO_VIDEO_SUBDIR = pathlib.Path('DCIM') / '100GOPRO'
 DEFAULT_THRESHOLD_MS = 1000.0
 
@@ -85,8 +87,27 @@ def _mount_unmounted_sd_cards() -> None:
             log.debug(f'Could not mount {dev_path}: {exc}')
 
 
+def _gopro_video_dirs(mount_point: pathlib.Path) -> list[pathlib.Path]:
+    """
+    Every ``DCIM/*GOPRO`` folder on the card, sorted.
+
+    The camera does not keep writing into ``100GOPRO`` forever: once a folder fills up (file
+    count or size limit) it rolls over to ``101GOPRO``, then ``102GOPRO``, and so on. A fetch
+    that only ever looks in ``100GOPRO`` finds every clip up to the first rollover and then,
+    silently, none of the clips after it -- every later session fails to match at all, with a
+    delta of however long ago ``100GOPRO`` stopped being written to, and re-running changes
+    nothing because the file it should have matched was never in the scanned directory. Glob
+    for every ``*GOPRO`` folder instead of hardcoding the first one so a rollover is invisible
+    to the caller.
+    """
+    dcim = mount_point / 'DCIM'
+    if not dcim.is_dir():
+        return []
+    return sorted(p for p in dcim.iterdir() if p.is_dir() and p.name.upper().endswith('GOPRO'))
+
+
 def find_gopro_mount(auto_mount: bool = True) -> pathlib.Path | None:
-    """Scan common Linux auto-mount roots for a volume containing DCIM/100GOPRO."""
+    """Scan common Linux auto-mount roots for a volume containing DCIM/<N>GOPRO."""
     if auto_mount:
         _mount_unmounted_sd_cards()
     for root in _MOUNT_ROOTS:
@@ -101,10 +122,10 @@ def find_gopro_mount(auto_mount: bool = True) -> pathlib.Path | None:
                 if not child.is_dir():
                     continue
                 # Direct mount (e.g. /mnt/gopro) or one level deeper (/media/<user>/<label>)
-                if (child / GOPRO_VIDEO_SUBDIR).is_dir():
+                if _gopro_video_dirs(child):
                     return child
                 for grandchild in child.iterdir():
-                    if grandchild.is_dir() and (grandchild / GOPRO_VIDEO_SUBDIR).is_dir():
+                    if grandchild.is_dir() and _gopro_video_dirs(grandchild):
                         return grandchild
             except (PermissionError, OSError):
                 continue
@@ -178,7 +199,7 @@ def find_gopro_video(
         Path to the best-matching MP4 file on the SD card.
 
     Raises:
-        FileNotFoundError: SD card not found, or DCIM/100GOPRO is missing/empty.
+        FileNotFoundError: SD card not found, or it has no DCIM/<N>GOPRO folder at all.
         RuntimeError: No file within *threshold_ms* of *start_time*.
 
     """
@@ -192,13 +213,17 @@ def find_gopro_video(
             )
         log.info(f'Auto-detected GoPro SD card at {mount_point}')
 
-    video_dir = mount_point / GOPRO_VIDEO_SUBDIR
-    if not video_dir.is_dir():
-        raise FileNotFoundError(f'GoPro video directory not found: {video_dir}')
+    # Every DCIM/<N>GOPRO folder, not just the first: the camera rolls over to a new one once
+    # the current folder fills up, so a card mid-collection routinely has more than one.
+    video_dirs = _gopro_video_dirs(mount_point)
+    if not video_dirs:
+        raise FileNotFoundError(f'No DCIM/<N>GOPRO folder found under {mount_point}')
 
-    mp4_files = sorted(video_dir.glob('*.MP4')) + sorted(video_dir.glob('*.mp4'))
+    mp4_files = [
+        f for video_dir in video_dirs for f in sorted(video_dir.glob('*.MP4')) + sorted(video_dir.glob('*.mp4'))
+    ]
     if not mp4_files:
-        raise FileNotFoundError(f'No MP4 files found in {video_dir}')
+        raise FileNotFoundError(f'No MP4 files found in {", ".join(str(d) for d in video_dirs)}')
 
     if start_time.tzinfo is None:
         start_time = start_time.astimezone(datetime.timezone.utc)
