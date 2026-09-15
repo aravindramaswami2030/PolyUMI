@@ -190,8 +190,10 @@ def scan_remote(args: argparse.Namespace) -> list[dict]:
             if key not in newest or run["mtime"] > newest[key]["mtime"]:
                 newest[key] = run
         runs = list(newest.values())
+    model_order = {name: index for index, name in enumerate(args.model)}
     runs.sort(key=lambda run: (
-        run["dataset"], run["policy"], run["model"], run["run_id"]
+        run["dataset"], model_order.get(run["model"], len(model_order)),
+        run["policy"], run["model"], run["run_id"],
     ))
     if args.expect and len(runs) != args.expect:
         raise SystemExit(
