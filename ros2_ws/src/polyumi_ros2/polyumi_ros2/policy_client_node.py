@@ -779,7 +779,9 @@ class PolicyClientNode(Node):
                 piezo_end_ns = self._piezo_end_ns
             if piezo_end_ns is None:
                 return None
-            piezo_end = rclpy.time.Time(nanoseconds=piezo_end_ns)
+            # The buffer holds bare nanoseconds; rebuild on the header stamps' clock, since
+            # Time(nanoseconds=...) defaults to SYSTEM_TIME and _frame_at compares against ROS_TIME.
+            piezo_end = rclpy.time.Time(nanoseconds=piezo_end_ns, clock_type=image_stamp.clock_type)
             instants.append(piezo_end - Duration(seconds=self._latency['piezo_mic']))
         return min(instants, key=lambda t: t.nanoseconds)
 
