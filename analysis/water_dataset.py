@@ -44,10 +44,23 @@ MEL_T = 256  # every trial's spectrogram is resampled to this many frames
 IMG = 224
 K_FRAMES = 8  # frames kept per trial per camera, evenly spaced across the window
 TAIL_S = 0.0  # seconds of the END of each bag to keep; 0 keeps the WHOLE bag. See --tail-s.
+# Low edge of the mel filterbank, in Hz. 20 keeps everything the mic hears; see mel_filterbank
+# for why that buries the signal under shake rumble. Override with --f-min.
+F_MIN = 20.0
 
 
-def mel_filterbank(n_fft: int, n_mels: int, sr: int) -> np.ndarray:
-    """Triangular mel filterbank, so this needs no torchaudio/librosa in the ROS env."""
+def mel_filterbank(n_fft: int, n_mels: int, sr: int, f_min: float = F_MIN) -> np.ndarray:
+    """
+    Triangular mel filterbank, so this needs no torchaudio/librosa in the ROS env.
+
+    `f_min` matters far more than it looks. The shake puts most of the recorded energy into arm
+    rumble below a couple of hundred hertz -- measured on the rv4 set, 76% of the power inside a
+    20 Hz floor sits in 20-200 Hz, a band that classifies the three materials at barely above
+    chance. The bands that DO separate them (500 Hz-1 kHz and 2-4 kHz) carry 1-2% of the power
+    each, so with the floor at 20 Hz they are a rounding error in the spectrogram and the encoder
+    largely ignores them. Raising the floor spends every mel bin on the part of the spectrum that
+    carries the label.
+    """
 
     def hz_to_mel(f):
         return 2595.0 * np.log10(1.0 + f / 700.0)
@@ -56,7 +69,7 @@ def mel_filterbank(n_fft: int, n_mels: int, sr: int) -> np.ndarray:
         return 700.0 * (10.0 ** (m / 2595.0) - 1.0)
 
     n_bins = n_fft // 2 + 1
-    pts = mel_to_hz(np.linspace(hz_to_mel(20.0), hz_to_mel(sr / 2), n_mels + 2))
+    pts = mel_to_hz(np.linspace(hz_to_mel(f_min), hz_to_mel(sr / 2), n_mels + 2))
     bins = np.floor((n_fft + 1) * pts / sr).astype(int)
     bins = np.clip(bins, 0, n_bins - 1)
     fb = np.zeros((n_mels, n_bins), dtype=np.float64)
@@ -99,7 +112,7 @@ def _resample_mel(lm: np.ndarray, t: int = MEL_T) -> np.ndarray:
     return np.stack([np.interp(dst, src, row) for row in lm])
 
 
-def read_trial(bag: pathlib.Path, tail_s: float = TAIL_S) -> dict[str, np.ndarray]:
+def read_trial(bag: pathlib.Path, tail_s: float = TAIL_S, f_min: float = F_MIN) -> dict[str, np.ndarray]:
     """
     Extract the three modality tensors from one bag; `tail_s` > 0 keeps only its last seconds.
 
@@ -169,7 +182,7 @@ def read_trial(bag: pathlib.Path, tail_s: float = TAIL_S) -> dict[str, np.ndarra
         tac = [x for x, t in zip(tac, tac_t) if t >= cutoff] or tac
         vis = [x for x, t in zip(vis, vis_t) if t >= cutoff] or vis
 
-    fb = mel_filterbank(N_FFT, N_MELS, sr)
+    fb = mel_filterbank(N_FFT, N_MELS, sr, f_min)
     if pcm:
         lm = _resample_mel(log_mel(np.concatenate(pcm), sr, fb))
     else:
@@ -207,9 +220,23 @@ def main() -> int:
     ap.add_argument(
         '--val-from',
         type=int,
-        default=26,
-        help='trials numbered this or higher are the validation split; the '
-        'default holds out the last 5 of 30 per level',
+        default=21,
+        help='first trial number of the validation split',
+    )
+    ap.add_argument(
+        '--f-min',
+        type=float,
+        default=F_MIN,
+        help='low edge of the mel filterbank in Hz (default 20). Raising it to ~300 drops the '
+        'arm-rumble band, which carries most of the power and almost none of the label',
+    )
+    ap.add_argument(
+        '--test-from',
+        type=int,
+        default=31,
+        help='first trial number of the TEST split, which must be higher than --val-from. '
+        'Trials below --val-from train, those between the two validate, those at or above '
+        'this test. Set it above the highest trial number to collect no test split at all.',
     )
     args = ap.parse_args()
 
@@ -227,15 +254,26 @@ def main() -> int:
         for bag in sorted((args.root / level).glob('trial_*')):
             if not bag.is_dir():
                 continue
-            f = read_trial(bag, tail_s=args.tail_s)
+            f = read_trial(bag, tail_s=args.tail_s, f_min=args.f_min)
             for k in rows:
                 rows[k].append(f[k])
             labels.append(li)
             names.append(f'{level}/{bag.name}')
-            # Split by trial NUMBER, not at random: the last trials of a level are the ones most
-            # likely to have drifted (bottle warming, grip settling), so holding those out is the
-            # harder and the more honest test, and it needs no seed to reproduce.
-            splits.append('val' if int(bag.name.split('_')[-1]) >= args.val_from else 'train')
+            # Split by trial NUMBER, not at random, and into three parts. Collection is
+            # interleaved in blocks, so consecutive trial numbers within a class come from one
+            # block -- which makes each split a DIFFERENT block from the others. That is the
+            # point: a model that has merely learnt a per-block nuisance (the finger camera's
+            # level and colour balance settle slightly differently each time the rig is
+            # disturbed) cannot carry it across the boundary, whereas a random split would hand
+            # it trials from the same block it trained on and score it far too well. It also
+            # needs no seed to reproduce.
+            n_trial = int(bag.name.split('_')[-1])
+            if n_trial >= args.test_from:
+                splits.append('test')
+            elif n_trial >= args.val_from:
+                splits.append('val')
+            else:
+                splits.append('train')
             counts.append((int(f['n_audio'][0]), int(f['n_tactile'][0]), int(f['n_vision'][0])))
             print(
                 f'  {level:<6} {bag.name:<12} audio={counts[-1][0]:>4} '
@@ -260,7 +298,14 @@ def main() -> int:
     )
     print('  tensor shapes: ' + ', '.join(f'{k}{out[k].shape[1:]}' for k in rows))
     n_tr = sum(1 for sp in splits if sp == 'train')
-    print(f'  split: {n_tr} train / {len(splits) - n_tr} val (val = trial >= {args.val_from})')
+    n_va = splits.count('val')
+    n_te = splits.count('test')
+    print(
+        f'  split: {n_tr} train / {n_va} val / {n_te} test  '
+        f'(val = trial >= {args.val_from}, test = trial >= {args.test_from})'
+    )
+    if n_te == 0:
+        print('  note: no test trials -- --test-from is above every trial number present')
     print(
         f'  msgs/trial (min): audio {counts_arr[:, 0].min()} '
         f'tactile {counts_arr[:, 1].min()} vision {counts_arr[:, 2].min()}'

@@ -156,7 +156,12 @@ for i in $(seq 0 $((COUNT - 1))); do
         SHAKE_RUN+=(-p "home_xyz:=${HOME_XYZ}")
     fi
 
-    SHAKE_LOG="$(mktemp)"
+    # Not a bare mktemp: an exported TMPDIR pointing at a directory that does not exist makes it
+    # fail, and under `set -e` that aborts the run between the recorder starting and the shake --
+    # so the bag is opened, nothing moves, and the trial is lost. Create TMPDIR if it is named,
+    # then fall back to /tmp, which is the one directory that is always there.
+    mkdir -p "${TMPDIR:-/tmp}" 2>/dev/null || true
+    SHAKE_LOG="$(mktemp 2>/dev/null || mktemp -p /tmp)"
     ros2 run polyumi_ros2 water_shake "${SHAKE_RUN[@]}" 2>&1 | tee "${SHAKE_LOG}" || {
         echo "WARNING: shake failed on trial ${TRIAL}; the bag will be short." >&2
     }
