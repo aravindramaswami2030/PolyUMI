@@ -1,0 +1,2 @@
+name	policy	variant	epochs	batch_size
+polytouch	vista	polytouch	120	4
