@@ -9,7 +9,7 @@
     # requested/published every steps_per_inference ticks, while the arm executes the previous
     # one. This is UMI's scheme (re-infer every ~steps_per_inference*dt) and it stops the
     # per-tick POST/publish storm. 1 = infer every tick. Should be <= n_action_steps.
-    steps_per_inference: 3
+    steps_per_inference: 1
 
     # How many action steps to request per inference. The chunk must span the whole
     # observation->motion budget for a device, or every action in it is already in the past by the
