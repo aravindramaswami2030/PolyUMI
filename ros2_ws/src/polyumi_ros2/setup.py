@@ -60,6 +60,7 @@ setup(
             'latency_probe = polyumi_ros2.latency_probe:main',
             'servo_smoke_test = polyumi_ros2.servo_smoke_test:main',
             'water_shake = polyumi_ros2.water_shake:main',
+            'texture_collect = polyumi_ros2.texture_collect:main',
         ],
     },
 )
