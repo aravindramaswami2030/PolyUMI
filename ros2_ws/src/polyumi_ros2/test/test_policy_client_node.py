@@ -1125,6 +1125,27 @@ def test_observation_instant_is_the_oldest_stream_not_the_wrist_camera(make_node
     assert t_obs.nanoseconds == _t(99.85).nanoseconds, 'must take the finger camera, the oldest'
 
 
+def test_a_piezo_bound_instant_can_be_used_against_the_image_history(make_node):
+    """
+    When the contact mic is the oldest stream, t_obs is rebuilt from bare nanoseconds.
+
+    It must land on the header stamps' clock, or _frame_at's comparison against the ROS_TIME image
+    history raises "Can't compare times with different clock types" and kills the node.
+    """
+    node = make_node()
+    node._send_tactile = True
+    node._latency.update({'gopro': 0.0, 'finger_cam': 0.0, 'piezo_mic': 0.0})
+    node._latest_image_stamp = _t(100.0)
+    node._latest_finger_stamp = _t(100.0)
+    node._piezo_end_ns = _t(99.5).nanoseconds
+
+    t_obs = node._observation_instant()
+
+    assert t_obs.nanoseconds == _t(99.5).nanoseconds, 'the piezo must set t_obs here'
+    history = deque([(_t(99.4), 'frame'), (_t(99.9), 'newer')])
+    assert node._frame_at(history, t_obs, 0.0)[1] == 'frame'
+
+
 def test_observation_instant_ignores_tactile_when_it_is_off(make_node):
     """With send_tactile off the wrist camera is the only stream, so it sets the instant alone."""
     node = make_node()
