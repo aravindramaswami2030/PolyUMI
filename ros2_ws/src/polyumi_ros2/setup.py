@@ -55,6 +55,8 @@ setup(
     entry_points={
         'console_scripts': [
             'pi_receiver_node = polyumi_ros2.pi_receiver_node:main',
+            'logmel_node = polyumi_ros2.logmel_node:main',
+            'audio_channel_node = polyumi_ros2.audio_channel_node:main',
             'policy_client_node = polyumi_ros2.policy_client_node:main',
             'tcp_pivot_test = polyumi_ros2.tcp_pivot_test:main',
             'latency_probe = polyumi_ros2.latency_probe:main',

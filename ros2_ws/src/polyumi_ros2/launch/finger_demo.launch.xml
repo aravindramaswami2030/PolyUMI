@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Finger-only streaming demo: the Pi's finger camera, its raw contact-mic audio, and a live
+  log-mel view of that same audio, in one Foxglove session.
+
+  Deliberately has NO GoPro node, unlike stream_demo.launch.xml. The wrist camera needs an Elgato
+  capture card, and when one is not attached the v4l2 node fails and takes the demo's credibility
+  with it. Nothing here touches /dev/video*.
+-->
+<launch>
+  <arg name="pi_host" description="IP address or hostname of the Raspberry Pi"
+    default="10.12.194.1"/>
+  <arg name="channel" description="Which capture channel to split out and show. 0 is the piezo
+    contact mic, the channel mic_0 is built from and the only one a policy ever sees. Setting it
+    to 1 moves BOTH the waveform and the spectrogram together; see docs/contact-mic-audio.md
+    before reading channel 1 as an independent air mic." default="0"/>
+  <arg name="window_s" description="Seconds of audio shown across the spectrogram" default="4.0"/>
+  <arg name="port" description="Foxglove bridge websocket port" default="8765"/>
+
+  <include file="$(find-pkg-share foxglove_bridge)/launch/foxglove_bridge_launch.xml">
+    <arg name="port" value="$(var port)"/>
+  </include>
+
+  <node pkg="polyumi_ros2" exec="pi_receiver_node" name="pi_receiver" output="screen"
+    namespace="pi">
+    <param name="pi_host" value="$(var pi_host)"/>
+  </node>
+
+  <!-- Mono contact-mic topic, so the viewer draws one waveform rather than the stereo pair.
+       The stereo topic is left untouched for ingest and the sync chirp. -->
+  <node pkg="polyumi_ros2" exec="audio_channel_node" name="piezo_split" output="screen">
+    <param name="input_topic" value="/pi/audio/raw"/>
+    <param name="output_topic" value="/pi/audio/piezo"/>
+    <param name="channel" value="$(var channel)"/>
+  </node>
+
+  <!-- Draws the mono topic the splitter just published, not the stereo one, so the waveform
+       panel and the spectrogram are provably the same samples and `channel` is honoured in
+       exactly one place. channel=0 here is the whole stream, since that topic is already mono. -->
+  <node pkg="polyumi_ros2" exec="logmel_node" name="logmel" output="screen">
+    <param name="audio_topic" value="/pi/audio/piezo"/>
+    <param name="image_topic" value="/pi/finger/logmel"/>
+    <param name="channel" value="0"/>
+    <param name="window_s" value="$(var window_s)"/>
+  </node>
+</launch>
